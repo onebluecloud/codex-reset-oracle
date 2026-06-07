@@ -9,13 +9,24 @@ type CollectorResult = {
 const GITHUB_ISSUES_URL =
   "https://api.github.com/repos/openai/codex/issues?state=all&sort=updated&direction=desc&per_page=50";
 
+function githubHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    accept: "application/vnd.github+json",
+    "x-github-api-version": "2022-11-28"
+  };
+
+  const token = process.env.GITHUB_TOKEN?.trim();
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+
+  return headers;
+}
+
 export async function collectGithubSignals(): Promise<CollectorResult> {
   try {
     const response = await fetch(GITHUB_ISSUES_URL, {
-      headers: {
-        accept: "application/vnd.github+json",
-        "x-github-api-version": "2022-11-28"
-      }
+      headers: githubHeaders()
     });
 
     if (!response.ok) {

@@ -18,6 +18,7 @@ function jsonResponse(payload: unknown, init: ResponseInit = {}): Response {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("collectApifySignals", () => {
@@ -108,7 +109,8 @@ describe("collectOpenAIStatusSignals", () => {
 });
 
 describe("collectGithubSignals", () => {
-  it("fetches GitHub issues and normalizes signals", async () => {
+  it("fetches GitHub issues and normalizes signals without a token", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "");
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse([githubIssueFixture]));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -118,15 +120,28 @@ describe("collectGithubSignals", () => {
     expect(result.signals[0]?.source).toBe("github");
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.github.com/repos/openai/codex/issues?state=all&sort=updated&direction=desc&per_page=50",
-      {
-        headers: {
-          accept: "application/vnd.github+json",
-          "x-github-api-version": "2022-11-28"
-        }
-      }
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(
+      "https://api.github.com/repos/openai/codex/issues?state=all&sort=updated&direction=desc&per_page=50"
     );
+    expect(init.headers).toEqual({
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28"
+    });
+  });
+
+  it("sends an Authorization header when GITHUB_TOKEN is set", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "ghp_example_token");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse([githubIssueFixture]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await collectGithubSignals();
+
+    expect(result.status.ok).toBe(true);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(init.headers).toMatchObject({
+      authorization: "Bearer ghp_example_token"
+    });
   });
 
   it("fails when GitHub returns a non-array payload", async () => {
@@ -178,7 +193,7 @@ describe("collectResetRadarSignals", () => {
       title: "Codex Reset Radar: medium probability",
       matchedKeywords: ["codex", "reset"]
     });
-    expect(result.signals[0]?.strength).toBeCloseTo(0.36);
+    expect(result.signals[0]?.strength).toBeCloseTo(0.26);
     expect(result.signals[0]?.reason).toContain("24h 26%");
     expect(fetchMock).toHaveBeenCalledWith("https://codex-reset-radar.pages.dev/current.json", {
       headers: { accept: "application/json" }
@@ -214,7 +229,7 @@ describe("collectResetRadarSignals", () => {
     const result = await collectResetRadarSignals();
 
     expect(result.status.ok).toBe(true);
-    expect(result.signals[0]?.strength).toBeCloseTo(0.35);
+    expect(result.signals[0]?.strength).toBeCloseTo(0.25);
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });

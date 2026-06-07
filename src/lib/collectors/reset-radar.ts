@@ -102,9 +102,8 @@ function normalizeResetRadarPayload(value: unknown): Signal | null {
   const checkedAt = stringOrUndefined(payload.checked_at) ?? stringOrUndefined(payload.generated_at);
   const publishedAt = dateIsoOrEpoch(checkedAt);
   const probability24h = clampUnit(prediction.probability24h);
-  const probability48h = clampUnit(prediction.probability48h);
   const reasonParts = [
-    `Codex Reset Radar estimates 24h ${formatPercent(probability24h)} and 48h ${formatPercent(probability48h)}.`,
+    `Codex Reset Radar: 24h ${formatPercent(probability24h)} reset chance.`,
     prediction.expectedWindow ? `Expected window: ${prediction.expectedWindow}.` : "",
     prediction.reasoningSummary ?? ""
   ].filter(Boolean);
@@ -112,7 +111,7 @@ function normalizeResetRadarPayload(value: unknown): Signal | null {
     stringOrUndefined(payload.message),
     prediction.expectedWindow,
     prediction.reasoningSummary,
-    `24h ${formatPercent(probability24h)}; 48h ${formatPercent(probability48h)}.`
+    `24h ${formatPercent(probability24h)}.`
   ].filter(Boolean);
 
   return {
@@ -120,7 +119,7 @@ function normalizeResetRadarPayload(value: unknown): Signal | null {
     source: "codex-reset-radar",
     sourceLabel: "Codex Reset Radar",
     sourceWeight: 1,
-    strength: probability48h,
+    strength: probability24h,
     title: `Codex Reset Radar: ${prediction.level} probability`,
     text: textParts.join(" "),
     url: RESET_RADAR_PAGE_URL,

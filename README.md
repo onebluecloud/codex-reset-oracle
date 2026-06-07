@@ -11,7 +11,9 @@ Unofficial Codex reset forecast dashboard built from public signals. It watches 
    npm install
    ```
 
-3. Copy `.env.example` to `.env` and set `APIFY_TOKEN` if X/Twitter collection is needed. The Codex Reset Radar fallback, OpenAI Status, and GitHub sources work without an API token.
+3. Copy `.env.example` to `.env`. The app runs without any token, but two are optional:
+   - `APIFY_TOKEN` enables X/Twitter collection.
+   - `GITHUB_TOKEN` (any read-only personal access token) raises the GitHub API rate limit from 60 to 5,000 requests/hour. Without it the GitHub collector is quickly throttled with HTTP 403, especially on shared or serverless IPs.
 4. Start the local app:
 
    ```bash

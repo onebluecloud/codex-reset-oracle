@@ -92,8 +92,8 @@ function agreementBonus(items: ScoredSignal[]): number {
 }
 
 function predictionWindow(chance: number): string {
-  if (chance >= 75) return "Likely within 6-18 hours";
-  if (chance >= 55) return "Possible within 18-36 hours";
+  if (chance >= 75) return "Likely within 24h";
+  if (chance >= 55) return "Possible within 24h";
   if (chance >= 35) return "Watch for more signals";
   return "No clear reset window";
 }

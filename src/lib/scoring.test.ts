@@ -95,7 +95,7 @@ describe("scoreForecast", () => {
     const forecast = scoreForecast(githubSignals, NOW);
 
     expect(forecast.chance).toBeLessThan(55);
-    expect(forecast.window).not.toBe("Likely within 6-18 hours");
+    expect(forecast.window).not.toBe("Likely within 24h");
   });
 
   it("uses Codex Reset Radar probability as an aggregate forecast signal", () => {
