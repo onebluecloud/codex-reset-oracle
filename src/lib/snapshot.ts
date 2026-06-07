@@ -1,4 +1,3 @@
-import { collectApifySignals } from "./collectors/apify";
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
@@ -69,12 +68,6 @@ async function collectWithFallback(
 
 export async function collectSnapshot(): Promise<Snapshot> {
   const results = await Promise.all([
-    collectWithFallback("x", "X collector failed.", () =>
-      collectApifySignals({
-        token: process.env.APIFY_TOKEN,
-        actorId: process.env.APIFY_ACTOR_ID
-      })
-    ),
     collectWithFallback("openai-status", "OpenAI Status collector failed.", collectOpenAIStatusSignals),
     collectWithFallback("github", "GitHub collector failed.", collectGithubSignals),
     collectWithFallback("codex-reset-radar", "Codex Reset Radar collector failed.", collectResetRadarSignals)

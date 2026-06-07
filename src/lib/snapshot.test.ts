@@ -1,16 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { collectApifySignals } from "./collectors/apify";
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { buildSnapshot, collectSnapshot, refreshMinutes } from "./snapshot";
 import type { CollectorStatus, Signal } from "./types";
-
-vi.mock("./collectors/apify", () => ({
-  collectApifySignals: vi.fn()
-}));
 
 vi.mock("./collectors/openai-status", () => ({
   collectOpenAIStatusSignals: vi.fn()
@@ -147,14 +142,10 @@ describe("refreshMinutes", () => {
 describe("collectSnapshot", () => {
   it("keeps healthy collector signals when one collector throws", async () => {
     const healthySignal = signal({ id: "healthy-status-signal", source: "openai-status" });
-    vi.mocked(collectApifySignals).mockRejectedValue(new Error("Bearer token APIFY_TOKEN=secret"));
+    vi.mocked(collectGithubSignals).mockRejectedValue(new Error("Bearer token APIFY_TOKEN=secret"));
     vi.mocked(collectOpenAIStatusSignals).mockResolvedValue({
       status: collectorStatus({ source: "openai-status" }),
       signals: [healthySignal]
-    });
-    vi.mocked(collectGithubSignals).mockResolvedValue({
-      status: collectorStatus({ source: "github" }),
-      signals: []
     });
     vi.mocked(collectResetRadarSignals).mockResolvedValue({
       status: collectorStatus({ source: "codex-reset-radar" }),
@@ -166,9 +157,9 @@ describe("collectSnapshot", () => {
     expect(snapshot.forecast.status).toBe("partial");
     expect(snapshot.signals).toEqual([healthySignal]);
     expect(snapshot.collectors).toContainEqual({
-      source: "x",
+      source: "github",
       ok: false,
-      message: "X collector failed."
+      message: "GitHub collector failed."
     });
     expect(snapshot.collectors.map((collector) => collector.message).join(" ")).not.toMatch(SECRET_PATTERN);
   });
@@ -178,10 +169,6 @@ describe("collectSnapshot", () => {
       id: "radar-current",
       source: "codex-reset-radar",
       sourceLabel: "Codex Reset Radar"
-    });
-    vi.mocked(collectApifySignals).mockResolvedValue({
-      status: collectorStatus({ source: "x", ok: false, message: "APIFY_TOKEN is missing." }),
-      signals: []
     });
     vi.mocked(collectOpenAIStatusSignals).mockResolvedValue({
       status: collectorStatus({ source: "openai-status" }),
