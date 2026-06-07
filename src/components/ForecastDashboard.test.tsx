@@ -64,6 +64,11 @@ const rawCollectorSnapshot: Snapshot = {
       source: "github",
       ok: false,
       message: "GitHub collector failed with HTTP 403."
+    },
+    {
+      source: "codex-reset-radar",
+      ok: false,
+      message: "Radar upstream failure with secret token."
     }
   ]
 };
@@ -100,6 +105,7 @@ describe("ForecastDashboard", () => {
     expect(screen.getByText("X/Twitter source needs setup or is unavailable.")).toBeInTheDocument();
     expect(screen.getByText("OpenAI Status source is unavailable.")).toBeInTheDocument();
     expect(screen.getByText("GitHub source is unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Codex Reset Radar source is unavailable.")).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(/APIFY_TOKEN|Bearer|HTTP 403|secret|upstream failure/i);
   });
 

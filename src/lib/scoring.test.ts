@@ -79,6 +79,89 @@ describe("scoreForecast", () => {
     expect(forecast.window).toBe("No clear reset window");
   });
 
+  it("keeps repeated GitHub issues from creating a likely reset forecast by themselves", () => {
+    const githubSignals = Array.from({ length: 20 }, (_, index) =>
+      signal({
+        id: `github-${index}`,
+        source: "github",
+        sourceWeight: 0.45,
+        strength: 1,
+        title: `GitHub quota reset issue ${index}`,
+        url: `https://github.com/openai/codex/issues/${index}`,
+        publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+      })
+    );
+
+    const forecast = scoreForecast(githubSignals, NOW);
+
+    expect(forecast.chance).toBeLessThan(55);
+    expect(forecast.window).not.toBe("Likely within 6-18 hours");
+  });
+
+  it("uses Codex Reset Radar probability as an aggregate forecast signal", () => {
+    const forecast = scoreForecast(
+      [
+        signal({
+          id: "radar-current",
+          source: "codex-reset-radar",
+          sourceLabel: "Codex Reset Radar",
+          sourceWeight: 1,
+          strength: 0.35,
+          title: "Codex Reset Radar: medium probability",
+          url: "https://codex-reset-radar.pages.dev/en/",
+          publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+        })
+      ],
+      NOW
+    );
+
+    expect(forecast.chance).toBe(35);
+    expect(forecast.window).toBe("Watch for more signals");
+  });
+
+  it("does not treat GitHub issues as independent confirmation of a Radar forecast", () => {
+    const githubSignals = Array.from({ length: 20 }, (_, index) =>
+      signal({
+        id: `github-noise-${index}`,
+        source: "github",
+        sourceWeight: 0.45,
+        strength: 1,
+        title: `GitHub quota reset issue ${index}`,
+        url: `https://github.com/openai/codex/issues/${index}`,
+        publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+      })
+    );
+    const forecast = scoreForecast(
+      [
+        signal({
+          id: "radar-current",
+          source: "codex-reset-radar",
+          sourceLabel: "Codex Reset Radar",
+          sourceWeight: 1,
+          strength: 0.35,
+          title: "Codex Reset Radar: medium probability",
+          url: "https://codex-reset-radar.pages.dev/en/",
+          publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+        }),
+        signal({
+          id: "stale-status",
+          source: "openai-status",
+          sourceWeight: 0.9,
+          strength: 0.5,
+          title: "Stale OpenAI Status Codex limit mention",
+          url: "https://status.openai.com",
+          publishedAt: new Date("2026-06-04T12:00:00.000Z").toISOString()
+        }),
+        ...githubSignals
+      ],
+      NOW
+    );
+
+    expect(forecast.chance).toBeLessThan(55);
+    expect(forecast.window).toBe("Watch for more signals");
+    expect(forecast.topSignals[0]?.source).toBe("codex-reset-radar");
+  });
+
   it("does not count stale sources toward cross-source agreement", () => {
     const forecast = scoreForecast(
       [

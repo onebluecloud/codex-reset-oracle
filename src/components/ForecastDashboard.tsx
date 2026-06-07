@@ -18,7 +18,8 @@ const STATUS_LABELS: Record<ForecastStatus, string> = {
 const SOURCE_LABELS: Record<SignalSource, string> = {
   x: "X/Twitter",
   "openai-status": "OpenAI Status",
-  github: "GitHub"
+  github: "GitHub",
+  "codex-reset-radar": "Codex Reset Radar"
 };
 
 function formatGeneratedAt(value: string): string {
@@ -51,6 +52,10 @@ function collectorStatusMessage(collector: CollectorStatus): string {
 
   if (collector.source === "openai-status") {
     return "OpenAI Status source is unavailable.";
+  }
+
+  if (collector.source === "codex-reset-radar") {
+    return "Codex Reset Radar source is unavailable.";
   }
 
   return "GitHub source is unavailable.";

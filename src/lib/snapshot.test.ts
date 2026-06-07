@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { collectApifySignals } from "./collectors/apify";
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
+import { collectResetRadarSignals } from "./collectors/reset-radar";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { buildSnapshot, collectSnapshot, refreshMinutes } from "./snapshot";
 import type { CollectorStatus, Signal } from "./types";
@@ -17,6 +18,10 @@ vi.mock("./collectors/openai-status", () => ({
 
 vi.mock("./collectors/github", () => ({
   collectGithubSignals: vi.fn()
+}));
+
+vi.mock("./collectors/reset-radar", () => ({
+  collectResetRadarSignals: vi.fn()
 }));
 
 const NOW = new Date("2026-06-07T12:00:00.000Z");
@@ -151,6 +156,10 @@ describe("collectSnapshot", () => {
       status: collectorStatus({ source: "github" }),
       signals: []
     });
+    vi.mocked(collectResetRadarSignals).mockResolvedValue({
+      status: collectorStatus({ source: "codex-reset-radar" }),
+      signals: []
+    });
 
     const snapshot = await collectSnapshot();
 
@@ -162,6 +171,36 @@ describe("collectSnapshot", () => {
       message: "X collector failed."
     });
     expect(snapshot.collectors.map((collector) => collector.message).join(" ")).not.toMatch(SECRET_PATTERN);
+  });
+
+  it("includes Codex Reset Radar as a no-API fallback source", async () => {
+    const radarSignal = signal({
+      id: "radar-current",
+      source: "codex-reset-radar",
+      sourceLabel: "Codex Reset Radar"
+    });
+    vi.mocked(collectApifySignals).mockResolvedValue({
+      status: collectorStatus({ source: "x", ok: false, message: "APIFY_TOKEN is missing." }),
+      signals: []
+    });
+    vi.mocked(collectOpenAIStatusSignals).mockResolvedValue({
+      status: collectorStatus({ source: "openai-status" }),
+      signals: []
+    });
+    vi.mocked(collectGithubSignals).mockResolvedValue({
+      status: collectorStatus({ source: "github" }),
+      signals: []
+    });
+    vi.mocked(collectResetRadarSignals).mockResolvedValue({
+      status: collectorStatus({ source: "codex-reset-radar" }),
+      signals: [radarSignal]
+    });
+
+    const snapshot = await collectSnapshot();
+
+    expect(collectResetRadarSignals).toHaveBeenCalledTimes(1);
+    expect(snapshot.signals).toEqual([radarSignal]);
+    expect(snapshot.collectors.map((collector) => collector.source)).toContain("codex-reset-radar");
   });
 });
 

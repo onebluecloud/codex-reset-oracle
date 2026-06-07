@@ -1,4 +1,4 @@
-export type SignalSource = "x" | "openai-status" | "github";
+export type SignalSource = "x" | "openai-status" | "github" | "codex-reset-radar";
 
 export type ForecastStatus = "ok" | "partial" | "stale" | "no-data";
 

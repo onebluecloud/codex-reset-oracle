@@ -1,6 +1,6 @@
 # Codex Reset Oracle
 
-Unofficial Codex reset forecast dashboard built from public signals. It watches public signals from X/Twitter through Apify, OpenAI Status, and GitHub issues, then explains why the reset chance moved.
+Unofficial Codex reset forecast dashboard built from public signals. It watches Codex Reset Radar, OpenAI Status, GitHub issues, and optional X/Twitter data through Apify, then explains why the reset chance moved.
 
 ## Setup
 
@@ -11,7 +11,7 @@ Unofficial Codex reset forecast dashboard built from public signals. It watches 
    npm install
    ```
 
-3. Copy `.env.example` to `.env` and set `APIFY_TOKEN` if live snapshot refreshes are needed.
+3. Copy `.env.example` to `.env` and set `APIFY_TOKEN` if X/Twitter collection is needed. The Codex Reset Radar fallback, OpenAI Status, and GitHub sources work without an API token.
 4. Start the local app:
 
    ```bash
@@ -25,12 +25,15 @@ Unofficial Codex reset forecast dashboard built from public signals. It watches 
 The app is designed to use public signals only:
 
 - Public X posts and conversations collected through the Apify actor configured by `APIFY_ACTOR_ID`.
+- Public Codex Reset Radar `current.json` forecast data.
 - Public OpenAI Status incident data.
 - Public GitHub issues and discussions related to Codex reset behavior.
 - Publicly visible timestamps, user reports, and observed reset-related language.
 - Local derived snapshots produced from the configured refresh cadence.
 
 No private OpenAI account data, private X data, or non-public quota telemetry should be used.
+
+If `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` is set, the Next.js dev/build/start scripts automatically enable Node's environment proxy support when the local Node runtime supports it.
 
 ## Forecast Score
 

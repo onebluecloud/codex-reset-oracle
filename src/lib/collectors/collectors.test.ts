@@ -6,6 +6,7 @@ import { statusIncidentFixture } from "@/test/fixtures/status";
 import { collectApifySignals } from "./apify";
 import { collectGithubSignals } from "./github";
 import { collectOpenAIStatusSignals } from "./openai-status";
+import { collectResetRadarSignals } from "./reset-radar";
 
 function jsonResponse(payload: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(payload), {
@@ -135,5 +136,85 @@ describe("collectGithubSignals", () => {
 
     expect(result.status.ok).toBe(false);
     expect(result.signals).toEqual([]);
+  });
+});
+
+describe("collectResetRadarSignals", () => {
+  it("fetches Codex Reset Radar current.json and normalizes prediction signals", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        checked_at: "2026-06-07T08:28:49.554447+08:00",
+        status: "none",
+        window_open: false,
+        message: "暂无正式速蹬窗口",
+        links: { html: "index.html" },
+        prediction: {
+          level: "medium",
+          probability_24h: 0.26,
+          probability_48h: 0.36,
+          expected_window: "未来 24-48 小时",
+          reasoning_summary:
+            "当前没有官方开启窗口，也没有 Tibo/Sam/OpenAI 明确暗示下一次 Codex reset。",
+          signal_summary_24h: {
+            candidate_total: 9,
+            observation_counts: {
+              official_x: 0,
+              community_x: 12,
+              openai_status: 1
+            }
+          }
+        }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await collectResetRadarSignals();
+
+    expect(result.status.ok).toBe(true);
+    expect(result.signals).toHaveLength(1);
+    expect(result.signals[0]).toMatchObject({
+      source: "codex-reset-radar",
+      sourceLabel: "Codex Reset Radar",
+      title: "Codex Reset Radar: medium probability",
+      matchedKeywords: ["codex", "reset"]
+    });
+    expect(result.signals[0]?.strength).toBeCloseTo(0.36);
+    expect(result.signals[0]?.reason).toContain("24h 26%");
+    expect(fetchMock).toHaveBeenCalledWith("https://codex-reset-radar.pages.dev/current.json", {
+      headers: { accept: "application/json" }
+    });
+  });
+
+  it("fails when Codex Reset Radar returns an unexpected JSON shape", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ prediction: null })));
+
+    const result = await collectResetRadarSignals();
+
+    expect(result.status.ok).toBe(false);
+    expect(result.signals).toEqual([]);
+  });
+
+  it("retries transient Codex Reset Radar request failures", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("read ECONNRESET"))
+      .mockRejectedValueOnce(new Error("read ECONNRESET"))
+      .mockResolvedValue(
+        jsonResponse({
+          checked_at: "2026-06-07T11:27:49.811587+08:00",
+          prediction: {
+            level: "medium",
+            probability_24h: 0.25,
+            probability_48h: 0.35
+          }
+        })
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await collectResetRadarSignals();
+
+    expect(result.status.ok).toBe(true);
+    expect(result.signals[0]?.strength).toBeCloseTo(0.35);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
