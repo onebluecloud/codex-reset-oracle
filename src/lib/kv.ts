@@ -87,6 +87,21 @@ export async function recordReset(at: string = new Date().toISOString()): Promis
   const client = redis();
   if (!client) throw new Error("KV is not configured.");
 
+  // Debounce double-marks: ignore a reset logged within 6h of the most recent one,
+  // which would otherwise create a physically-impossible tiny gap and distort cadence.
+  const recentResets = await readResets(10);
+  if (recentResets.length > 0) {
+    const lastMs = Date.parse(recentResets[0].at);
+    const nowMs = Date.parse(at);
+    if (
+      Number.isFinite(lastMs) &&
+      Number.isFinite(nowMs) &&
+      Math.abs(nowMs - lastMs) < 6 * 3_600_000
+    ) {
+      return recentResets[0];
+    }
+  }
+
   const record: ResetRecord = { kind: "reset", at };
   await client.lpush(HISTORY_KEY, record);
   await client.ltrim(HISTORY_KEY, 0, HISTORY_LIMIT - 1);
@@ -97,4 +112,38 @@ export async function readHistory(limit: number = 50): Promise<HistoryEntry[]> {
   const client = redis();
   if (!client) return [];
   return (await client.lrange<HistoryEntry>(HISTORY_KEY, 0, Math.max(0, limit - 1))) ?? [];
+}
+
+/** All logged actual resets, most-recent first — feeds the cadence prior in scoring. */
+export async function readResets(limit: number = 100): Promise<ResetRecord[]> {
+  const history = await readHistory(limit);
+  return history.filter((entry): entry is ResetRecord => entry.kind === "reset");
+}
+
+const PREDLOG_KEY = "oracle:predlog";
+const PREDLOG_LIMIT = 500;
+
+/**
+ * Unbiased log of EVERY forecast (deduped to one per hour), separate from the >=80%
+ * alert. This is the ground-truth substrate a later calibration pass resolves:
+ * "predicted X% at time T — did a reset actually happen within 24h?".
+ */
+export async function recordPredictionSnapshot(forecast: Forecast): Promise<void> {
+  const client = redis();
+  if (!client) return;
+
+  const hourKey = `oracle:predlog-hour:${new Date().toISOString().slice(0, 13)}`;
+  const fresh = await client.set(hourKey, "1", { nx: true, ex: 3600 });
+  if (fresh === null) return; // already logged this hour
+
+  const record = {
+    at: forecast.generatedAt || new Date().toISOString(),
+    chance: forecast.chance,
+    signalChance: forecast.signalChance ?? forecast.chance,
+    priorChance: forecast.priorChance ?? null,
+    horizonH: 24,
+    resolved: false as const
+  };
+  await client.lpush(PREDLOG_KEY, record);
+  await client.ltrim(PREDLOG_KEY, 0, PREDLOG_LIMIT - 1);
 }

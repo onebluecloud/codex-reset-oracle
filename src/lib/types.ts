@@ -25,6 +25,15 @@ export type Signal = {
   reason: string;
 };
 
+export type Cadence = {
+  medianGapHours: number;
+  muHatHours: number;
+  sigHatHours: number;
+  nResets: number;
+  confidence: number;
+  computedAt: string;
+};
+
 export type Forecast = {
   status: ForecastStatus;
   chance: number;
@@ -32,6 +41,10 @@ export type Forecast = {
   summary: string;
   topSignals: Signal[];
   generatedAt: string;
+  /** Present only when a validated cadence prior is blended in. */
+  priorChance?: number;
+  signalChance?: number;
+  cadence?: Cadence;
 };
 
 export type Snapshot = {

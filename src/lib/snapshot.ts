@@ -1,7 +1,8 @@
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
-import { maybeRecordPrediction, storeLatestSnapshot } from "./kv";
+import { maybeRecordPrediction, readResets, recordPredictionSnapshot, storeLatestSnapshot } from "./kv";
+import type { ResetRecord } from "./kv";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { scoreForecast } from "./scoring";
 import type { CollectorStatus, Signal, SignalSource, Snapshot } from "./types";
@@ -24,10 +25,14 @@ function dedupeSignals(signals: Signal[]): Signal[] {
   return deduped;
 }
 
-export function buildSnapshot(results: CollectorResult[], now = new Date()): Snapshot {
+export function buildSnapshot(
+  results: CollectorResult[],
+  now = new Date(),
+  resets: ResetRecord[] = []
+): Snapshot {
   const collectors = results.map((result) => result.status);
   const signals = dedupeSignals(results.flatMap((result) => result.signals));
-  const forecast = scoreForecast(signals, now);
+  const forecast = scoreForecast(signals, now, resets);
   const hasFailedCollector = collectors.some((collector) => !collector.ok);
 
   return {
@@ -74,7 +79,14 @@ export async function collectSnapshot(): Promise<Snapshot> {
     collectWithFallback("codex-reset-radar", "Codex Reset Radar collector failed.", collectResetRadarSignals)
   ]);
 
-  return buildSnapshot(results);
+  let resets: ResetRecord[] = [];
+  try {
+    resets = await readResets();
+  } catch {
+    resets = [];
+  }
+
+  return buildSnapshot(results, new Date(), resets);
 }
 
 export async function refreshAndStore(): Promise<Snapshot> {
@@ -82,6 +94,7 @@ export async function refreshAndStore(): Promise<Snapshot> {
   try {
     await storeLatestSnapshot(snapshot);
     await maybeRecordPrediction(snapshot.forecast);
+    await recordPredictionSnapshot(snapshot.forecast);
   } catch {
     // KV unavailable — still return the freshly collected snapshot.
   }

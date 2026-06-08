@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { scoreForecast } from "./scoring";
+import type { ResetRecord } from "./kv";
+import { __test, scoreForecast } from "./scoring";
 import type { Signal } from "./types";
 
 const NOW = new Date("2026-06-07T12:00:00.000Z");
@@ -258,5 +259,108 @@ describe("scoreForecast", () => {
     expect(Number.isFinite(forecast.chance)).toBe(true);
     expect(forecast.chance).toBeGreaterThanOrEqual(1);
     expect(forecast.chance).toBeLessThanOrEqual(95);
+  });
+});
+
+describe("cadence prior (time-since-last-reset)", () => {
+  function radarSignals(): Signal[] {
+    return [
+      signal({
+        id: "radar",
+        source: "codex-reset-radar",
+        sourceWeight: 1,
+        strength: 0.4,
+        publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+      })
+    ];
+  }
+
+  function regularResets(count: number, lastAt: Date, gapHours = 168): ResetRecord[] {
+    const resets: ResetRecord[] = [];
+    for (let i = 0; i < count; i += 1) {
+      resets.push({
+        kind: "reset",
+        at: new Date(lastAt.getTime() - i * gapHours * 3_600_000).toISOString()
+      });
+    }
+    return resets;
+  }
+
+  it("omitting resets equals passing [] — never-worse fallback", () => {
+    const s = radarSignals();
+    const a = scoreForecast(s, NOW);
+    const b = scoreForecast(s, NOW, []);
+    expect(a.chance).toBe(b.chance);
+    expect(a.window).toBe(b.window);
+    expect(a.summary).toBe(b.summary);
+  });
+
+  it("too few resets keep the prior inactive (identical to signal-only)", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const resets = regularResets(3, new Date("2026-06-05T12:00:00.000Z")); // 2 gaps < 4
+    expect(scoreForecast(s, NOW, resets).chance).toBe(signalOnly);
+  });
+
+  it("a validated cadence that is overdue pushes the chance up", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const lastReset = new Date(NOW.getTime() - 200 * 3_600_000); // overdue vs ~168h cadence
+    const forecast = scoreForecast(s, NOW, regularResets(6, lastReset));
+    expect(forecast.chance).toBeGreaterThan(signalOnly);
+    expect(forecast.cadence?.confidence ?? 0).toBeGreaterThan(0);
+    expect(forecast.priorChance).toBeDefined();
+  });
+
+  it("a validated cadence that just reset pulls the chance down", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const lastReset = new Date(NOW.getTime() - 12 * 3_600_000); // far too soon vs ~168h
+    const forecast = scoreForecast(s, NOW, regularResets(6, lastReset));
+    expect(forecast.chance).toBeLessThanOrEqual(signalOnly);
+  });
+
+  it("irregular gaps (high variation) keep the prior inactive", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const at = (h: number) => new Date(NOW.getTime() - h * 3_600_000).toISOString();
+    const resets: ResetRecord[] = [
+      { kind: "reset", at: at(10) },
+      { kind: "reset", at: at(60) },
+      { kind: "reset", at: at(70) },
+      { kind: "reset", at: at(400) },
+      { kind: "reset", at: at(420) }
+    ];
+    expect(scoreForecast(s, NOW, resets).chance).toBe(signalOnly);
+  });
+
+  it("ignores non-finite reset timestamps without throwing", () => {
+    const s = radarSignals();
+    const resets: ResetRecord[] = [
+      { kind: "reset", at: "not-a-date" },
+      { kind: "reset", at: "still-bad" }
+    ];
+    expect(() => scoreForecast(s, NOW, resets)).not.toThrow();
+    expect(scoreForecast(s, NOW, resets).chance).toBe(scoreForecast(s, NOW, []).chance);
+  });
+
+  describe("numeric helpers", () => {
+    it("median handles odd and even lengths", () => {
+      expect(__test.median([3, 1, 2])).toBe(2);
+      expect(__test.median([4, 1, 2, 3])).toBe(2.5);
+    });
+
+    it("regularized lower gamma matches the exponential CDF at k=1", () => {
+      expect(__test.lowerRegularizedGammaP(1, 1)).toBeCloseTo(1 - Math.exp(-1), 4);
+      expect(__test.lowerRegularizedGammaP(1, 2)).toBeCloseTo(1 - Math.exp(-2), 4);
+    });
+
+    it("regularized lower gamma is monotonic in x and within [0,1]", () => {
+      const a = __test.lowerRegularizedGammaP(4, 2);
+      const b = __test.lowerRegularizedGammaP(4, 8);
+      expect(a).toBeGreaterThanOrEqual(0);
+      expect(b).toBeLessThanOrEqual(1);
+      expect(b).toBeGreaterThan(a);
+    });
   });
 });
