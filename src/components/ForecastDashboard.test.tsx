@@ -94,25 +94,28 @@ describe("ForecastDashboard", () => {
     render(<ForecastDashboard initialSnapshot={sampleSnapshot} />);
 
     expect(screen.getByText("Codex Reset Chance")).toBeInTheDocument();
-    expect(screen.getByText("72%")).toBeInTheDocument();
+    expect(screen.getByText("72")).toBeInTheDocument();
     expect(screen.getByText("Possible within 18-36 hours")).toBeInTheDocument();
     expect(screen.getByText("Tibo mentioned reset and capacity.")).toBeInTheDocument();
   });
 
-  it("renders safe collector status copy without raw collector messages", () => {
+  it("renders safe source labels without raw collector messages", () => {
     render(<ForecastDashboard initialSnapshot={rawCollectorSnapshot} />);
 
-    expect(screen.getByText("X/Twitter source needs setup or is unavailable.")).toBeInTheDocument();
-    expect(screen.getByText("OpenAI Status source is unavailable.")).toBeInTheDocument();
-    expect(screen.getByText("GitHub source is unavailable.")).toBeInTheDocument();
-    expect(screen.getByText("Codex Reset Radar source is unavailable.")).toBeInTheDocument();
+    // The quiet footer surfaces only friendly source names — never raw upstream text.
+    expect(screen.getByText("X/Twitter")).toBeInTheDocument();
+    expect(screen.getByText("OpenAI Status")).toBeInTheDocument();
+    expect(screen.getByText("GitHub")).toBeInTheDocument();
+    expect(screen.getByText("Reset Radar")).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(/APIFY_TOKEN|Bearer|HTTP 403|secret|upstream failure/i);
   });
 
-  it("mentions stale collector data without rendering raw collector messages", () => {
+  it("never renders raw stale-collector messages", () => {
     render(<ForecastDashboard initialSnapshot={staleCollectorSnapshot} />);
 
-    expect(screen.getByText("X/Twitter source data may be stale.")).toBeInTheDocument();
+    // "X/Twitter" appears both as a signal source and as a footer chip — either is fine;
+    // the contract is that the raw upstream message never reaches the DOM.
+    expect(screen.getAllByText("X/Twitter").length).toBeGreaterThan(0);
     expect(document.body).not.toHaveTextContent(/Bearer|secret|upstream failure/i);
   });
 
@@ -125,7 +128,7 @@ describe("ForecastDashboard", () => {
     render(<ForecastDashboard initialSnapshot={sampleSnapshot} />);
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
-    expect(await screen.findByText("Could not refresh snapshot. Try again shortly.")).toBeInTheDocument();
+    expect(await screen.findByText("Could not refresh. Try again shortly.")).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(/APIFY_TOKEN|Bearer|HTTP 403|secret|upstream failure/i);
   });
 });

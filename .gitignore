@@ -12,3 +12,8 @@ logs/
 *.log
 tsconfig.tsbuildinfo
 .vercel
+
+# Local scratch & marketing drafts — not for the public repo
+_mockup/
+xiaohongshu/
+.playwright-mcp/

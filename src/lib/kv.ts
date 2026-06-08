@@ -147,3 +147,26 @@ export async function recordPredictionSnapshot(forecast: Forecast): Promise<void
   await client.lpush(PREDLOG_KEY, record);
   await client.ltrim(PREDLOG_KEY, 0, PREDLOG_LIMIT - 1);
 }
+
+export type PredlogPoint = { at: string; chance: number };
+
+/**
+ * Chronological (oldest-first) probability points for the homepage trend wave.
+ * The predlog is deduped to one entry per hour, so `limit` ≈ hours of history;
+ * the default 40 comfortably covers the "last 30h" axis with headroom.
+ */
+export async function readPredlog(limit: number = 40): Promise<PredlogPoint[]> {
+  const client = redis();
+  if (!client) return [];
+
+  const rows =
+    (await client.lrange<{ at?: string; chance?: number }>(PREDLOG_KEY, 0, Math.max(0, limit - 1))) ?? [];
+
+  // Stored newest-first via lpush — reverse to chronological for the time axis.
+  return rows
+    .map((row) => ({
+      at: typeof row?.at === "string" ? row.at : "",
+      chance: typeof row?.chance === "number" && Number.isFinite(row.chance) ? row.chance : 0
+    }))
+    .reverse();
+}

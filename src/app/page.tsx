@@ -1,6 +1,6 @@
 import { ForecastDashboard } from "@/components/ForecastDashboard";
 import type { HistoryEntry } from "@/lib/kv";
-import { readHistory, readLatestSnapshot } from "@/lib/kv";
+import { readHistory, readLatestSnapshot, readPredlog } from "@/lib/kv";
 import { refreshAndStore } from "@/lib/snapshot";
 import type { Snapshot } from "@/lib/types";
 
@@ -22,15 +22,20 @@ const EMPTY_SNAPSHOT: Snapshot = {
 export default async function HomePage() {
   let snapshot: Snapshot = EMPTY_SNAPSHOT;
   let history: HistoryEntry[] = [];
+  let trend: number[] = [];
 
   try {
     // Read the last stored snapshot so the page shows a number immediately;
     // if nothing is stored yet, collect once and store it.
     snapshot = (await readLatestSnapshot()) ?? (await refreshAndStore());
     history = await readHistory(50);
+    // Real probability history feeds the trend wave's baseline.
+    trend = (await readPredlog(40)).map((point) => point.chance);
   } catch {
     // KV unavailable — render the empty state; the client Refresh button still works.
   }
 
-  return <ForecastDashboard initialSnapshot={snapshot} initialHistory={history} />;
+  return (
+    <ForecastDashboard initialSnapshot={snapshot} initialHistory={history} initialTrend={trend} />
+  );
 }
