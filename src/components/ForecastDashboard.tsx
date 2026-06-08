@@ -455,7 +455,9 @@ export function ForecastDashboard({
                 <span className="track-tag">
                   {entry.kind === "prediction" ? `Predicted ${entry.chance}%` : "Actual reset"}
                 </span>
-                <span className="track-time">{formatGeneratedAt(entry.at)}</span>
+                <span className="track-time" suppressHydrationWarning>
+                  {formatGeneratedAt(entry.at)}
+                </span>
               </li>
             ))}
           </ul>
@@ -480,7 +482,7 @@ export function ForecastDashboard({
         </div>
 
         <div className="ground-actions">
-          <span className="updated">
+          <span className="updated" suppressHydrationWarning>
             Updated {formatGeneratedAt(forecast.generatedAt)} · {okCollectors}/
             {snapshot.collectors.length || 3} sources
           </span>
