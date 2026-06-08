@@ -107,7 +107,8 @@ body::before {
 }
 
 .forecast-body {
-  align-items: end;
+  align-items: center;
+  gap: 40px;
 }
 
 .section-label {
@@ -245,32 +246,91 @@ button:disabled {
   line-height: 1.55;
 }
 
-.score-block {
-  display: grid;
-  justify-items: end;
-  gap: 10px;
-  min-width: 240px;
-}
-
-.score {
-  font-size: 5.6rem;
-  font-weight: 800;
-  line-height: 0.86;
-  letter-spacing: -0.05em;
-  background: linear-gradient(180deg, #ffffff 0%, #aab2ff 120%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
+.forecast-lede {
+  max-width: 480px;
 }
 
 .forecast-window {
-  max-width: 300px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 20px;
   color: var(--fg-2);
-  font-size: 1.02rem;
+  font-size: 0.98rem;
   font-weight: 600;
-  line-height: 1.35;
   letter-spacing: -0.01em;
-  text-align: right;
+}
+
+.window-tick {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-bright);
+  box-shadow: 0 0 10px 1px var(--accent-bright);
+}
+
+.gauge {
+  position: relative;
+  width: 224px;
+  height: 224px;
+  flex: 0 0 auto;
+}
+
+.gauge-svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+  overflow: visible;
+}
+
+.gauge-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.06);
+  stroke-width: 13;
+}
+
+.gauge-fill {
+  fill: none;
+  stroke: url(#gaugeGradient);
+  stroke-width: 13;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 12px rgba(94, 106, 210, 0.55));
+  transition: stroke-dashoffset 800ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.gauge-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.gauge-value {
+  display: flex;
+  align-items: baseline;
+  color: var(--fg);
+  font-size: 3.9rem;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.045em;
+}
+
+.gauge-pct {
+  margin-left: 3px;
+  color: var(--accent-bright);
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+.gauge-sub {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
 }
 
 .forecast-actions {
@@ -478,16 +538,15 @@ button:disabled {
     font-size: 2.3rem;
   }
 
-  .score-block {
-    justify-items: start;
-    min-width: 0;
+  .gauge {
+    width: 190px;
+    height: 190px;
   }
 
-  .score {
-    font-size: 4.2rem;
+  .gauge-value {
+    font-size: 3.2rem;
   }
 
-  .forecast-window,
   .updated-at {
     text-align: left;
   }
@@ -498,7 +557,12 @@ button:disabled {
     font-size: 2rem;
   }
 
-  .score {
-    font-size: 3.6rem;
+  .gauge {
+    width: 172px;
+    height: 172px;
+  }
+
+  .gauge-value {
+    font-size: 2.9rem;
   }
 }

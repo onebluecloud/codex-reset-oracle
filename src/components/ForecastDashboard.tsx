@@ -104,6 +104,11 @@ export function ForecastDashboard({ initialSnapshot, initialHistory = [] }: Fore
   const forecast = snapshot.forecast;
   const topSignals = forecast.topSignals;
 
+  const gaugeRadius = 92;
+  const gaugeCircumference = 2 * Math.PI * gaugeRadius;
+  const clampedChance = Math.min(100, Math.max(0, forecast.chance));
+  const gaugeOffset = gaugeCircumference * (1 - clampedChance / 100);
+
   return (
     <main className="dashboard-shell">
       <section className="forecast-panel panel" aria-labelledby="forecast-title">
@@ -115,15 +120,41 @@ export function ForecastDashboard({ initialSnapshot, initialHistory = [] }: Fore
         </div>
 
         <div className="forecast-body">
-          <div>
+          <div className="forecast-lede">
             <p className="section-label">Unofficial public signal monitor</p>
             <h1 id="forecast-title">Codex Reset Chance</h1>
             <p className="forecast-summary">{forecast.summary}</p>
+            <div className="forecast-window">
+              <span className="window-tick" aria-hidden="true" />
+              {forecast.window}
+            </div>
           </div>
 
-          <div className="score-block" aria-label={`Reset chance ${forecast.chance}%`}>
-            <span className="score">{forecast.chance}%</span>
-            <span className="forecast-window">{forecast.window}</span>
+          <div className="gauge" role="img" aria-label={`Reset chance ${forecast.chance}% — ${forecast.window}`}>
+            <svg className="gauge-svg" viewBox="0 0 220 220">
+              <defs>
+                <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                  <stop offset="0%" stopColor="#5e6ad2" />
+                  <stop offset="100%" stopColor="#9aa6ff" />
+                </linearGradient>
+              </defs>
+              <circle className="gauge-track" cx="110" cy="110" r="92" />
+              <circle
+                className="gauge-fill"
+                cx="110"
+                cy="110"
+                r="92"
+                strokeDasharray={gaugeCircumference}
+                strokeDashoffset={gaugeOffset}
+              />
+            </svg>
+            <div className="gauge-center">
+              <span className="gauge-value">
+                {forecast.chance}
+                <span className="gauge-pct">%</span>
+              </span>
+              <span className="gauge-sub">next 24h</span>
+            </div>
           </div>
         </div>
 
