@@ -2,6 +2,8 @@
 
 Unofficial Codex reset forecast dashboard built from public signals. It watches Codex Reset Radar, OpenAI Status, GitHub issues, and optional X/Twitter data through Apify, then explains why the reset chance moved.
 
+**Live:** https://codex-reset-oracle.vercel.app
+
 ## Setup
 
 1. Install Node.js 22.
