@@ -11,3 +11,4 @@ test-results/
 logs/
 *.log
 tsconfig.tsbuildinfo
+.vercel

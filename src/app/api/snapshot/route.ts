@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 
-import { collectSnapshot } from "@/lib/snapshot";
+import { refreshAndStore } from "@/lib/snapshot";
 import type { Snapshot } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(): Promise<NextResponse<Snapshot>> {
   try {
-    return NextResponse.json(await collectSnapshot());
+    return NextResponse.json(await refreshAndStore());
   } catch {
     return NextResponse.json(
       {

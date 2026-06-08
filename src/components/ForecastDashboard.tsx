@@ -2,10 +2,12 @@
 
 import { useCallback, useState } from "react";
 
+import type { HistoryEntry } from "@/lib/kv";
 import type { CollectorStatus, ForecastStatus, SignalSource, Snapshot } from "@/lib/types";
 
 type ForecastDashboardProps = {
   initialSnapshot: Snapshot;
+  initialHistory?: HistoryEntry[];
 };
 
 const STATUS_LABELS: Record<ForecastStatus, string> = {
@@ -61,8 +63,9 @@ function collectorStatusMessage(collector: CollectorStatus): string {
   return "GitHub source is unavailable.";
 }
 
-export function ForecastDashboard({ initialSnapshot }: ForecastDashboardProps) {
+export function ForecastDashboard({ initialSnapshot, initialHistory = [] }: ForecastDashboardProps) {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
+  const [history, setHistory] = useState<HistoryEntry[]>(initialHistory);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -79,6 +82,18 @@ export function ForecastDashboard({ initialSnapshot }: ForecastDashboardProps) {
 
       const nextSnapshot = (await response.json()) as Snapshot;
       setSnapshot(nextSnapshot);
+
+      try {
+        const historyResponse = await fetch("/api/history", { cache: "no-store" });
+        if (historyResponse.ok) {
+          const payload = (await historyResponse.json()) as { history?: HistoryEntry[] };
+          if (Array.isArray(payload.history)) {
+            setHistory(payload.history);
+          }
+        }
+      } catch {
+        // History refresh is best-effort; ignore failures.
+      }
     } catch {
       setError("Could not refresh snapshot. Try again shortly.");
     } finally {
@@ -181,6 +196,31 @@ export function ForecastDashboard({ initialSnapshot }: ForecastDashboardProps) {
                   <p className="collector-source">{collectorLabel(collector)}</p>
                   <p className="collector-message">{collectorStatusMessage(collector)}</p>
                 </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="panel history-panel" aria-labelledby="history-title">
+        <div className="panel-heading">
+          <p className="section-label">Track record</p>
+          <h2 id="history-title">Prediction history</h2>
+        </div>
+
+        {history.length === 0 ? (
+          <p className="empty-state">
+            No high-chance predictions recorded yet. A record is logged when the reset chance crosses 80%, and again
+            when an actual reset is confirmed.
+          </p>
+        ) : (
+          <ul className="history-list">
+            {history.map((entry, index) => (
+              <li className={`history-row history-${entry.kind}`} key={`${entry.kind}-${entry.at}-${index}`}>
+                <span className={`history-tag history-tag-${entry.kind}`}>
+                  {entry.kind === "prediction" ? `Predicted ${entry.chance}%` : "Actual reset"}
+                </span>
+                <span className="history-time">{formatGeneratedAt(entry.at)}</span>
               </li>
             ))}
           </ul>

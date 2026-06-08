@@ -1,6 +1,7 @@
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
+import { maybeRecordPrediction, storeLatestSnapshot } from "./kv";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { scoreForecast } from "./scoring";
 import type { CollectorStatus, Signal, SignalSource, Snapshot } from "./types";
@@ -74,4 +75,15 @@ export async function collectSnapshot(): Promise<Snapshot> {
   ]);
 
   return buildSnapshot(results);
+}
+
+export async function refreshAndStore(): Promise<Snapshot> {
+  const snapshot = await collectSnapshot();
+  try {
+    await storeLatestSnapshot(snapshot);
+    await maybeRecordPrediction(snapshot.forecast);
+  } catch {
+    // KV unavailable — still return the freshly collected snapshot.
+  }
+  return snapshot;
 }
