@@ -180,11 +180,18 @@ body::before {
   font-weight: 800;
   line-height: 0.8;
   letter-spacing: -0.055em;
-  background: linear-gradient(172deg, #ffffff 8%, #cfd4ff 70%, #8b96f5 118%);
+  /* Stops 2 & 3 are warmed by JS as the chance climbs; defaults stay cold. */
+  background: linear-gradient(
+    172deg,
+    #ffffff 8%,
+    var(--fig-1, #cfd4ff) 70%,
+    var(--fig-2, #8b96f5) 118%
+  );
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   font-variant-numeric: tabular-nums;
+  transition: filter 240ms var(--ease);
 }
 
 .unit {

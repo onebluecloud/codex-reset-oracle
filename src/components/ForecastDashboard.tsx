@@ -63,6 +63,22 @@ function buildTrend(trend: number[] | undefined, chance: number): number[] {
   return points;
 }
 
+/**
+ * 0 below ~18% (calm indigo), ramping to 1 by ~78% (warm/alert).
+ * The wave and the giant readout heat up as a reset looks more imminent.
+ */
+function warmthFromChance(chance: number): number {
+  const w = Math.min(1, Math.max(0, (chance - 18) / 60));
+  return w * w * (3 - 2 * w); // smoothstep
+}
+
+function mixRgb(cold: readonly number[], warm: readonly number[], t: number): string {
+  const r = Math.round(cold[0] + (warm[0] - cold[0]) * t);
+  const g = Math.round(cold[1] + (warm[1] - cold[1]) * t);
+  const b = Math.round(cold[2] + (warm[2] - cold[2]) * t);
+  return `${r},${g},${b}`;
+}
+
 type MouseState = {
   x: number;
   y: number;
@@ -91,6 +107,7 @@ export function ForecastDashboard({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const trendRef = useRef<number[]>(buildTrend(initialTrend, chance));
+  const chanceRef = useRef<number>(chance);
   const mouseRef = useRef<MouseState>({
     x: -9999,
     y: 0.5,
@@ -102,11 +119,19 @@ export function ForecastDashboard({
     target: 0
   });
 
-  // Keep the wave's "now" edge in sync with the latest live chance.
+  // Keep the wave's "now" edge in sync with the latest live chance, and warm the
+  // hero readout's gradient as the chance climbs (set here, not in the RAF loop,
+  // so it also applies under prefers-reduced-motion).
   useEffect(() => {
     const points = trendRef.current.slice();
     points[points.length - 1] = chance;
     trendRef.current = points;
+    chanceRef.current = chance;
+
+    const warmth = warmthFromChance(chance);
+    const root = document.documentElement.style;
+    root.setProperty("--fig-1", `rgb(${mixRgb([207, 212, 255], [255, 216, 196], warmth)})`);
+    root.setProperty("--fig-2", `rgb(${mixRgb([139, 150, 245], [240, 135, 158], warmth)})`);
   }, [chance]);
 
   const refresh = useCallback(async () => {
@@ -193,10 +218,11 @@ export function ForecastDashboard({
     window.addEventListener("pointerleave", onLeave, { passive: true });
 
     // Three depth-stepped layers: faint back washes, one crisp data wave in front.
+    // Each carries a cold (calm) and warm (imminent) colour, blended by warmth.
     const layers = [
-      { amp: 13, freq: 0.0120, speed: 0.30, off: 0.0, w: 1, col: "94,106,210", a: 0.2, fill: 0.05, depth: 11 },
-      { amp: 20, freq: 0.0082, speed: -0.46, off: 1.7, w: 1.5, col: "120,132,250", a: 0.34, fill: 0.07, depth: 25 },
-      { amp: 30, freq: 0.0058, speed: 0.62, off: 3.1, w: 2.6, col: "174,182,255", a: 0.95, fill: 0.2, depth: 44 }
+      { amp: 13, freq: 0.0120, speed: 0.30, off: 0.0, w: 1, cold: [94, 106, 210], warm: [196, 116, 170], a: 0.2, fill: 0.05, depth: 11 },
+      { amp: 20, freq: 0.0082, speed: -0.46, off: 1.7, w: 1.5, cold: [120, 132, 250], warm: [240, 140, 150], a: 0.34, fill: 0.07, depth: 25 },
+      { amp: 30, freq: 0.0058, speed: 0.62, off: 3.1, w: 2.6, cold: [174, 182, 255], warm: [255, 178, 140], a: 0.95, fill: 0.2, depth: 44 }
     ];
 
     const clampIndex = (index: number, max: number) => Math.max(0, Math.min(max, index));
@@ -229,6 +255,7 @@ export function ForecastDashboard({
       let peak = 0;
       for (const value of points) peak = Math.max(peak, value);
       const maxY = Math.max(40, peak) * 1.25;
+      const warmth = warmthFromChance(chanceRef.current);
 
       ctx.clearRect(0, 0, width, height);
 
@@ -257,6 +284,8 @@ export function ForecastDashboard({
 
       layers.forEach((layer, li) => {
         const parallax = mouse.nx * layer.depth * mouse.active; // pseudo-3D depth
+        const col = mixRgb(layer.cold, layer.warm, warmth);
+        const fill = layer.fill * (1 + warmth * 0.5);
 
         // Area fill.
         ctx.beginPath();
@@ -269,8 +298,8 @@ export function ForecastDashboard({
         ctx.lineTo(0, height);
         ctx.closePath();
         const gradient = ctx.createLinearGradient(0, 0, 0, height);
-        gradient.addColorStop(0, `rgba(${layer.col},${layer.fill})`);
-        gradient.addColorStop(1, `rgba(${layer.col},0)`);
+        gradient.addColorStop(0, `rgba(${col},${fill})`);
+        gradient.addColorStop(1, `rgba(${col},0)`);
         ctx.fillStyle = gradient;
         ctx.fill();
 
@@ -281,11 +310,11 @@ export function ForecastDashboard({
           if (x === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }
-        ctx.strokeStyle = `rgba(${layer.col},${layer.a})`;
+        ctx.strokeStyle = `rgba(${col},${layer.a})`;
         ctx.lineWidth = layer.w;
         if (li === layers.length - 1) {
-          ctx.shadowColor = "rgba(130,143,255,0.6)";
-          ctx.shadowBlur = 15;
+          ctx.shadowColor = `rgba(${mixRgb([130, 143, 255], [255, 150, 120], warmth)},0.6)`;
+          ctx.shadowBlur = 15 + warmth * 9;
         }
         ctx.stroke();
         ctx.shadowBlur = 0;
@@ -294,7 +323,8 @@ export function ForecastDashboard({
       // "Now" marker on the front wave.
       const front = layers[layers.length - 1];
       const yNow = yAt(width, front, 0);
-      ctx.strokeStyle = "rgba(174,182,255,0.22)";
+      const guideCol = mixRgb([174, 182, 255], [255, 180, 150], warmth);
+      ctx.strokeStyle = `rgba(${guideCol},0.22)`;
       ctx.setLineDash([2, 5]);
       ctx.beginPath();
       ctx.moveTo(width - 1, yNow);
@@ -305,9 +335,9 @@ export function ForecastDashboard({
       const pulse = reduce ? 4.4 : 4.2 + Math.sin(t * 1.6) * 0.8;
       ctx.beginPath();
       ctx.arc(width - 2, yNow, pulse, 0, Math.PI * 2);
-      ctx.fillStyle = "#cfd4ff";
-      ctx.shadowColor = "rgba(174,182,255,0.9)";
-      ctx.shadowBlur = 16;
+      ctx.fillStyle = `rgb(${mixRgb([207, 212, 255], [255, 214, 184], warmth)})`;
+      ctx.shadowColor = `rgba(${guideCol},0.9)`;
+      ctx.shadowBlur = 16 + warmth * 8;
       ctx.fill();
       ctx.shadowBlur = 0;
 
