@@ -201,21 +201,27 @@ export function ForecastDashboard({
     observer.observe(wrap);
 
     const mouse = mouseRef.current;
+    // The wave only undulates while the cursor is over it; otherwise it holds still.
     const onMove = (event: PointerEvent) => {
       const rect = canvas.getBoundingClientRect();
       mouse.tx = event.clientX - rect.left;
       mouse.ty = (event.clientY - rect.top) / height;
       mouse.tnx = (event.clientX - rect.left) / width - 0.5;
       mouse.target = 1;
-      // Soft ambient glow that trails the cursor across the page.
-      document.documentElement.style.setProperty("--mx", `${event.clientX}px`);
-      document.documentElement.style.setProperty("--my", `${event.clientY}px`);
     };
     const onLeave = () => {
       mouse.target = 0;
     };
-    window.addEventListener("pointermove", onMove, { passive: true });
-    window.addEventListener("pointerleave", onLeave, { passive: true });
+    const onGlow = (event: PointerEvent) => {
+      // Soft ambient glow that trails the cursor across the page.
+      document.documentElement.style.setProperty("--mx", `${event.clientX}px`);
+      document.documentElement.style.setProperty("--my", `${event.clientY}px`);
+    };
+    if (!reduce) {
+      wrap.addEventListener("pointermove", onMove, { passive: true });
+      wrap.addEventListener("pointerleave", onLeave, { passive: true });
+      window.addEventListener("pointermove", onGlow, { passive: true });
+    }
 
     // Three depth-stepped layers: faint back washes, one crisp data wave in front.
     // Each carries a cold (calm) and warm (imminent) colour, blended by warmth.
@@ -227,59 +233,78 @@ export function ForecastDashboard({
 
     const clampIndex = (index: number, max: number) => Math.max(0, Math.min(max, index));
 
-    const levelAt = (v: number, maxY: number) => height * 0.64 - (v / maxY) * (height * 0.46);
-    const baseAt = (x: number, points: number[], maxY: number) => {
-      const n = points.length;
-      if (n === 1) return levelAt(points[0], maxY);
-      const f = (x / width) * (n - 1);
-      const i = Math.floor(f);
-      const t = f - i;
-      const a = points[clampIndex(i, n - 1)];
-      const b = points[clampIndex(i + 1, n - 1)];
-      const v = a + (b - a) * (t * t * (3 - 2 * t)); // smoothstep
-      return levelAt(v, maxY);
+    // Round the Y-axis ceiling up to a tidy probability scale (min 40%).
+    const niceMax = (peak: number) => {
+      const target = Math.max(peak, 1) * 1.2;
+      for (const m of [40, 60, 80, 100]) if (m >= target) return m;
+      return 100;
     };
 
-    let t = 0;
+    let phase = 0;
     let raf = 0;
+    let lastDraw = -1;
 
     const render = () => {
-      if (!reduce) t += 0.0125;
-
-      mouse.x += (mouse.tx - mouse.x) * 0.09;
-      mouse.y += (mouse.ty - mouse.y) * 0.09;
-      mouse.nx += (mouse.tnx - mouse.nx) * 0.09;
-      mouse.active += (mouse.target - mouse.active) * 0.06;
+      // Ease the cursor and advance the wave phase ONLY while engaged, so the
+      // wave is perfectly still at rest and undulates only under the cursor.
+      mouse.x += (mouse.tx - mouse.x) * 0.12;
+      mouse.y += (mouse.ty - mouse.y) * 0.12;
+      mouse.nx += (mouse.tnx - mouse.nx) * 0.12;
+      mouse.active += (mouse.target - mouse.active) * 0.07;
+      phase += 0.022 * mouse.active;
 
       const points = trendRef.current;
       let peak = 0;
       for (const value of points) peak = Math.max(peak, value);
-      const maxY = Math.max(40, peak) * 1.25;
+      const yMax = niceMax(peak);
       const warmth = warmthFromChance(chanceRef.current);
+
+      // Plot area leaves a left gutter for the Y axis and breathing room top/bottom.
+      const plotL = 46;
+      const plotT = height * 0.16;
+      const plotB = height * 0.88;
+      const plotW = Math.max(1, width - plotL);
+      const levelAt = (v: number) => plotB - (v / yMax) * (plotB - plotT);
+      const baseAt = (x: number) => {
+        const n = points.length;
+        if (n === 1) return levelAt(points[0]);
+        const f = ((x - plotL) / plotW) * (n - 1);
+        const i = Math.floor(f);
+        const tt = f - i;
+        const a = points[clampIndex(i, n - 1)];
+        const b = points[clampIndex(i + 1, n - 1)];
+        const v = a + (b - a) * (tt * tt * (3 - 2 * tt)); // smoothstep
+        return levelAt(v);
+      };
 
       ctx.clearRect(0, 0, width, height);
 
-      // Quiet reference grid — contrast-led separation, Apple restraint.
-      ctx.lineWidth = 1;
-      for (let g = 1; g <= 3; g += 1) {
-        const gy = (height / 4) * g;
-        ctx.strokeStyle = "rgba(255,255,255,0.028)";
+      // Y axis — probability scale with gridlines and labels.
+      ctx.font = "500 12px 'JetBrains Mono', ui-monospace, monospace";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "right";
+      for (const v of [0, yMax / 2, yMax]) {
+        const gy = levelAt(v);
+        ctx.strokeStyle = v === 0 ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.045)";
+        ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(0, gy);
+        ctx.moveTo(plotL, gy);
         ctx.lineTo(width, gy);
         ctx.stroke();
+        ctx.fillStyle = "rgba(255,255,255,0.34)";
+        ctx.fillText(`${v}%`, plotL - 10, gy);
       }
 
-      const breathe = reduce ? 1 : 0.9 + Math.sin(t * 0.6) * 0.1;
-      const sigma = Math.max(90, width * 0.11);
-      const globalAmp = breathe * (0.94 + (1 - mouse.y) * 0.7 * mouse.active);
+      const sigma = Math.max(90, plotW * 0.12);
+      const globalAmp = 0.55 + (1 - mouse.y) * 0.6 * mouse.active;
 
       const yAt = (x: number, layer: (typeof layers)[number], parallax: number) => {
         const sx = x - parallax;
-        const flow = Math.sin(sx * layer.freq + t * layer.speed + layer.off) * layer.amp;
+        const flow = Math.sin(sx * layer.freq + phase * layer.speed + layer.off) * layer.amp;
         const dx = x - mouse.x;
-        const swell = -Math.exp(-(dx * dx) / (2 * sigma * sigma)) * (34 + layer.depth * 0.28) * mouse.active;
-        return baseAt(sx, points, maxY) + flow * globalAmp + swell;
+        const swell = -Math.exp(-(dx * dx) / (2 * sigma * sigma)) * (30 + layer.depth * 0.28) * mouse.active;
+        const y = baseAt(sx) + flow * globalAmp + swell;
+        return Math.max(6, Math.min(height - 2, y));
       };
 
       layers.forEach((layer, li) => {
@@ -287,27 +312,27 @@ export function ForecastDashboard({
         const col = mixRgb(layer.cold, layer.warm, warmth);
         const fill = layer.fill * (1 + warmth * 0.5);
 
-        // Area fill.
+        // Area fill down to the 0% baseline.
         ctx.beginPath();
-        for (let x = 0; x <= width; x += 2) {
+        for (let x = plotL; x <= width; x += 2) {
           const y = yAt(x, layer, parallax);
-          if (x === 0) ctx.moveTo(x, y);
+          if (x === plotL) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }
-        ctx.lineTo(width, height);
-        ctx.lineTo(0, height);
+        ctx.lineTo(width, plotB);
+        ctx.lineTo(plotL, plotB);
         ctx.closePath();
-        const gradient = ctx.createLinearGradient(0, 0, 0, height);
+        const gradient = ctx.createLinearGradient(0, plotT, 0, plotB);
         gradient.addColorStop(0, `rgba(${col},${fill})`);
         gradient.addColorStop(1, `rgba(${col},0)`);
         ctx.fillStyle = gradient;
         ctx.fill();
 
-        // Stroke the crest.
+        // Crest line.
         ctx.beginPath();
-        for (let x = 0; x <= width; x += 2) {
+        for (let x = plotL; x <= width; x += 2) {
           const y = yAt(x, layer, parallax);
-          if (x === 0) ctx.moveTo(x, y);
+          if (x === plotL) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         }
         ctx.strokeStyle = `rgba(${col},${layer.a})`;
@@ -328,11 +353,11 @@ export function ForecastDashboard({
       ctx.setLineDash([2, 5]);
       ctx.beginPath();
       ctx.moveTo(width - 1, yNow);
-      ctx.lineTo(width - 1, height);
+      ctx.lineTo(width - 1, plotB);
       ctx.stroke();
       ctx.setLineDash([]);
 
-      const pulse = reduce ? 4.4 : 4.2 + Math.sin(t * 1.6) * 0.8;
+      const pulse = 4.2 + Math.sin(phase * 1.6) * 0.8 * mouse.active;
       ctx.beginPath();
       ctx.arc(width - 2, yNow, pulse, 0, Math.PI * 2);
       ctx.fillStyle = `rgb(${mixRgb([207, 212, 255], [255, 214, 184], warmth)})`;
@@ -340,17 +365,33 @@ export function ForecastDashboard({
       ctx.shadowBlur = 16 + warmth * 8;
       ctx.fill();
       ctx.shadowBlur = 0;
-
-      if (!reduce) raf = window.requestAnimationFrame(render);
     };
 
-    render();
+    // Full-rate while engaged or settling; otherwise redraw only a couple of
+    // times a second to pick up data/colour changes — the wave itself stays still.
+    const loop = (ts: number) => {
+      const engaged = mouse.active > 0.002 || mouse.target > 0;
+      if (engaged || lastDraw < 0 || ts - lastDraw > 400) {
+        render();
+        lastDraw = ts;
+      }
+      raf = window.requestAnimationFrame(loop);
+    };
+
+    if (reduce) {
+      render();
+    } else {
+      raf = window.requestAnimationFrame(loop);
+    }
 
     return () => {
       window.cancelAnimationFrame(raf);
       observer.disconnect();
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerleave", onLeave);
+      if (!reduce) {
+        wrap.removeEventListener("pointermove", onMove);
+        wrap.removeEventListener("pointerleave", onLeave);
+        window.removeEventListener("pointermove", onGlow);
+      }
     };
   }, []);
 

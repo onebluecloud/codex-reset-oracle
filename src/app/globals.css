@@ -275,6 +275,7 @@ body::before {
   display: flex;
   justify-content: space-between;
   margin-top: 10px;
+  padding-left: 46px; /* align with the wave plot area (Y-axis gutter) */
   font-family: var(--font-mono);
   font-size: 0.68rem;
   letter-spacing: 0.04em;
