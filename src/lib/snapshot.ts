@@ -3,7 +3,13 @@ import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
 import { collectResetHistory } from "./collectors/reset-history";
-import { maybeRecordPrediction, readResets, recordPredictionSnapshot, storeLatestSnapshot } from "./kv";
+import {
+  maybeRecordPrediction,
+  readResets,
+  recordPredictionSnapshot,
+  resolveDuePredlog,
+  storeLatestSnapshot
+} from "./kv";
 import type { ResetRecord } from "./kv";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { scoreForecast } from "./scoring";
@@ -141,6 +147,10 @@ export async function refreshAndStore(): Promise<Snapshot> {
     await storeLatestSnapshot(snapshot);
     await maybeRecordPrediction(snapshot.forecast);
     await recordPredictionSnapshot(snapshot.forecast);
+    // Resolve any predictions whose 24h horizon has elapsed against the actual
+    // fleet-wide resets — this is the ground truth the calibration curve reads.
+    const { resets } = await collectResetHistory();
+    await resolveDuePredlog(resets.map((reset) => reset.at));
   } catch {
     // KV unavailable — still return the freshly collected snapshot.
   }
