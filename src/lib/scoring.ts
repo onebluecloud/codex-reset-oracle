@@ -1,5 +1,5 @@
 import type { ResetRecord } from "./kv";
-import type { Cadence, Forecast, Signal } from "./types";
+import type { Cadence, Forecast, Milestone, Signal } from "./types";
 
 type ScoredSignal = {
   signal: Signal;
@@ -108,6 +108,16 @@ const REGULARITY_CV_GOOD = 0.4; // at/below this CV the cadence is a clean "cloc
 const REGULARITY_CV_CUTOFF = 1.0; // at/above this CV the cadence is too chaotic → prior inactive
 const MU_LOW = 0.5 * MU0_HOURS;
 const MU_HIGH = 2 * MU0_HOURS;
+
+// ── Milestone proximity (one-way catalyst) ───────────────────────────────────
+// Sam Altman pledged a reset at every +1M WAU up to 10M, so the next milestone is
+// a near-certain reset driver. We extrapolate its ETA from logged crossings and
+// lift the chance as it nears — ONLY upward, so it never double-counts the age
+// prior's "still early" dampening with its own.
+const W_MILESTONE_MAX = 0.3;
+const MILESTONE_CENTER = 0.75; // progress-to-next-milestone at which it is ~50% likely
+const MILESTONE_SLOPE = 0.2;
+const MIN_MILESTONES = 2; // need >= 2 crossings to estimate a growth rate
 
 function clip(value: number, lo: number, hi: number): number {
   if (!Number.isFinite(value)) return lo;
@@ -259,6 +269,30 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   return { pPrior, wPrior: W_PRIOR_MAX * confidence, cadence };
 }
 
+type MilestoneResult = { pMilestone: number; wMilestone: number };
+
+// Extrapolate the next +1M milestone's ETA from logged crossings; return a
+// proximity probability that rises as the forecast nears (and passes) that ETA.
+function milestonePrior(milestones: Milestone[], now: Date): MilestoneResult {
+  const points = milestones
+    .map((m) => ({ ms: Date.parse(m.at), countM: m.countM }))
+    .filter((p) => Number.isFinite(p.ms) && Number.isFinite(p.countM) && p.countM > 0)
+    .sort((a, b) => a.ms - b.ms);
+  if (points.length < MIN_MILESTONES) return { pMilestone: 0, wMilestone: 0 };
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  const spanDays = (last.ms - first.ms) / 86_400_000;
+  const countGain = last.countM - first.countM;
+  if (spanDays <= 0 || countGain <= 0) return { pMilestone: 0, wMilestone: 0 };
+
+  const daysPerMilestone = spanDays / countGain;
+  const daysSinceLast = (now.getTime() - last.ms) / 86_400_000;
+  const progress = clip(daysSinceLast / daysPerMilestone, 0, 5);
+  const pMilestone = clip(sigmoid((progress - MILESTONE_CENTER) / MILESTONE_SLOPE), 1e-3, 1 - 1e-3);
+  return { pMilestone, wMilestone: W_MILESTONE_MAX };
+}
+
 function predictionWindow(chance: number): string {
   if (chance >= 75) return "Likely within 24h";
   if (chance >= 55) return "Possible within 24h";
@@ -283,7 +317,8 @@ function summary(status: Forecast["status"], chance: number, cadence: Cadence | 
 export function scoreForecast(
   signals: Signal[],
   now: Date = new Date(),
-  resets: ResetRecord[] = []
+  resets: ResetRecord[] = [],
+  milestones: Milestone[] = []
 ): Forecast {
   if (signals.length === 0) {
     // No live signals → honest no-data. A prior must never fabricate a chance.
@@ -305,20 +340,33 @@ export function scoreForecast(
   const signalChance = Math.max(1, Math.min(95, Math.round(raw)));
 
   const { pPrior, wPrior, cadence } = periodicPrior(resets, now);
+  const pSignalClamped = clip(Math.min(raw, 95) / 100, 1e-3, 1 - 1e-3);
 
   let chance = signalChance;
   let priorChance: number | undefined;
 
   if (wPrior > 0) {
     // Blend the live signal with the age-conditioned periodic prior in logit space.
-    // (Clamp raw to the same 95 ceiling the signal-only path uses so an overflowing
-    // raw score can't saturate the logit.)
-    const pSignal = clip(Math.min(raw, 95) / 100, 1e-3, 1 - 1e-3);
-    const z = wPrior * logit(pPrior) + logit(pSignal);
+    const z = wPrior * logit(pPrior) + logit(pSignalClamped);
     chance = Math.max(1, Math.min(95, Math.round(100 * sigmoid(z))));
     priorChance = Math.max(1, Math.min(99, Math.round(100 * pPrior)));
   }
-  // else: short-circuit — chance stays = signalChance = today's exact output (never-worse).
+  // else: short-circuit — chance stays = signalChance (never-worse).
+
+  // Milestone proximity is a ONE-WAY catalyst: blend onto the live signal and take
+  // the max, so it lifts the chance as the next +1M milestone nears but never
+  // double-counts "still early" with the age prior (which already handles dampening).
+  const { pMilestone, wMilestone } = milestonePrior(milestones, now);
+  if (wMilestone > 0) {
+    const lifted = Math.max(
+      1,
+      Math.min(95, Math.round(100 * sigmoid(wMilestone * logit(pMilestone) + logit(pSignalClamped))))
+    );
+    if (lifted > chance) {
+      chance = lifted;
+      priorChance = Math.max(priorChance ?? 0, Math.max(1, Math.min(99, Math.round(100 * pMilestone))));
+    }
+  }
 
   const forecast: Forecast = {
     status: "ok",

@@ -15,10 +15,18 @@ export const KEYWORD_WEIGHTS: Record<string, number> = {
   limits: 0.3,
   capacity: 0.3,
   usage: 0.25,
-  degraded: 0.25,
-  incident: 0.2,
-  mitigated: 0.2,
-  recovery: 0.25,
+  // Incident-compensation precursors. 4 of the last 10 resets were "we had an
+  // incident, so we reset everyone's limits", so a fresh outage/degradation is a
+  // strong near-term reset signal — weighted up, plus the compensation vocabulary
+  // that tends to precede the reset announcement itself.
+  degraded: 0.3,
+  incident: 0.3,
+  outage: 0.3,
+  mitigated: 0.25,
+  recovery: 0.3,
+  restored: 0.25,
+  compensate: 0.3,
+  compensation: 0.3,
   queue: 0.15
 };
 

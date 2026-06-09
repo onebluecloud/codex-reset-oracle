@@ -362,6 +362,32 @@ describe("cadence prior (time-since-last-reset)", () => {
     expect(scoreForecast(s, NOW, resets).chance).toBe(scoreForecast(s, NOW, []).chance);
   });
 
+  it("a near user-count milestone lifts the chance (one-way catalyst)", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const day = (d: number) => new Date(NOW.getTime() - d * 86_400_000).toISOString();
+    // 3M/4M/5M ~13 days apart; last crossing 12 days ago → progress ~0.9, near next.
+    const milestones = [
+      { at: day(38), countM: 3 },
+      { at: day(25), countM: 4 },
+      { at: day(12), countM: 5 }
+    ];
+    expect(scoreForecast(s, NOW, [], milestones).chance).toBeGreaterThan(signalOnly);
+  });
+
+  it("a far milestone leaves the chance unchanged (no double-dampening)", () => {
+    const s = radarSignals();
+    const signalOnly = scoreForecast(s, NOW, []).chance;
+    const day = (d: number) => new Date(NOW.getTime() - d * 86_400_000).toISOString();
+    // Last crossing only 2 days ago vs ~13-day cadence → progress ~0.15, far off.
+    const milestones = [
+      { at: day(28), countM: 3 },
+      { at: day(15), countM: 4 },
+      { at: day(2), countM: 5 }
+    ];
+    expect(scoreForecast(s, NOW, [], milestones).chance).toBe(signalOnly);
+  });
+
   describe("numeric helpers", () => {
     it("median handles odd and even lengths", () => {
       expect(__test.median([3, 1, 2])).toBe(2);

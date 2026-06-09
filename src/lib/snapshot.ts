@@ -7,7 +7,7 @@ import { maybeRecordPrediction, readResets, recordPredictionSnapshot, storeLates
 import type { ResetRecord } from "./kv";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { scoreForecast } from "./scoring";
-import type { CollectorStatus, Signal, SignalSource, Snapshot } from "./types";
+import type { CollectorStatus, Milestone, Signal, SignalSource, Snapshot } from "./types";
 
 type CollectorResult = {
   status: CollectorStatus;
@@ -50,11 +50,12 @@ function mergeResets(a: ResetRecord[], b: ResetRecord[]): ResetRecord[] {
 export function buildSnapshot(
   results: CollectorResult[],
   now = new Date(),
-  resets: ResetRecord[] = []
+  resets: ResetRecord[] = [],
+  milestones: Milestone[] = []
 ): Snapshot {
   const collectors = results.map((result) => result.status);
   const signals = dedupeSignals(results.flatMap((result) => result.signals));
-  const forecast = scoreForecast(signals, now, resets);
+  const forecast = scoreForecast(signals, now, resets, milestones);
   const hasFailedCollector = collectors.some((collector) => !collector.ok);
 
   return {
@@ -118,17 +119,20 @@ export async function collectSnapshot(): Promise<Snapshot> {
   const results = await Promise.all(tasks);
 
   let resets: ResetRecord[] = [];
+  let milestones: Milestone[] = [];
   try {
-    // Logged resets (manual mark-reset, KV) + fleet-wide official resets parsed
-    // from Codex Reset Radar's recent_windows — merged so the age-since-last-reset
-    // prior has data without anyone hand-marking each reset.
-    const [logged, fromRadar] = await Promise.all([readResets(), collectResetHistory()]);
-    resets = mergeResets(logged, fromRadar);
+    // Logged resets (manual mark-reset, KV) + fleet-wide official resets and
+    // user-count milestones from Codex Reset Radar's recent_windows — so the
+    // time-based priors have data without anyone hand-marking each reset.
+    const [logged, radar] = await Promise.all([readResets(), collectResetHistory()]);
+    resets = mergeResets(logged, radar.resets);
+    milestones = radar.milestones;
   } catch {
     resets = [];
+    milestones = [];
   }
 
-  return buildSnapshot(results, new Date(), resets);
+  return buildSnapshot(results, new Date(), resets, milestones);
 }
 
 export async function refreshAndStore(): Promise<Snapshot> {

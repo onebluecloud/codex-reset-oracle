@@ -26,7 +26,7 @@ vi.mock("./collectors/reset-radar", () => ({
 }));
 
 vi.mock("./collectors/reset-history", () => ({
-  collectResetHistory: vi.fn(() => Promise.resolve([]))
+  collectResetHistory: vi.fn(() => Promise.resolve({ resets: [], milestones: [] }))
 }));
 
 const NOW = new Date("2026-06-07T12:00:00.000Z");
@@ -256,7 +256,7 @@ describe("collectSnapshot", () => {
       kind: "reset" as const,
       at: new Date(nowMs - (200 + i * 168) * 3_600_000).toISOString()
     }));
-    vi.mocked(collectResetHistory).mockResolvedValue(resets);
+    vi.mocked(collectResetHistory).mockResolvedValue({ resets, milestones: [] });
 
     const snapshot = await collectSnapshot();
 

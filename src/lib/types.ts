@@ -34,6 +34,13 @@ export type Cadence = {
   computedAt: string;
 };
 
+export type Milestone = {
+  /** ISO timestamp the milestone reset was crossed. */
+  at: string;
+  /** User count in millions (e.g. 5 for "500 万用户"). */
+  countM: number;
+};
+
 export type Forecast = {
   status: ForecastStatus;
   chance: number;

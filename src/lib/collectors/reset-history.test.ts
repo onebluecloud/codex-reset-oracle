@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isFleetWideScope, parseResetHistory } from "./reset-history";
+import { isFleetWideScope, parseMilestones, parseResetHistory } from "./reset-history";
 
 describe("parseResetHistory", () => {
   const payload = {
@@ -40,5 +40,53 @@ describe("isFleetWideScope", () => {
     expect(isFleetWideScope("现有 $200 Pro 用户")).toBe(false);
     expect(isFleetWideScope(null)).toBe(false);
     expect(isFleetWideScope(123)).toBe(false);
+  });
+});
+
+describe("parseMilestones", () => {
+  const payload = {
+    recent_windows: [
+      {
+        opened_at: "2026-05-31T13:59:00+08:00",
+        scope: "所有付费计划",
+        title: "500 万用户庆祝重置",
+        summary: "庆祝 Codex 达到 500 万用户。"
+      },
+      {
+        opened_at: "2026-04-21T22:52:00+08:00",
+        scope: "Codex 用户",
+        title: "400 万活跃用户里程碑重置",
+        summary: "Codex 达到 400 万活跃用户后。"
+      },
+      {
+        opened_at: "2026-04-09T10:31:00+08:00",
+        scope: "现有 $200 Pro 用户",
+        title: "300 万周活用户与新计划重置",
+        summary: "Codex 达到 300 万周活用户。"
+      },
+      {
+        opened_at: "2026-06-04T08:25:00+08:00",
+        scope: "所有付费计划",
+        title: "Codex 可靠性事故补偿重置",
+        summary: "三次小事故后重置，无里程碑。"
+      }
+    ]
+  };
+
+  it("extracts user-count milestones (any scope) sorted ascending by count", () => {
+    const ms = parseMilestones(payload);
+    expect(ms.map((m) => m.countM)).toEqual([3, 4, 5]);
+    expect(ms[2].at).toBe(new Date("2026-05-31T13:59:00+08:00").toISOString());
+  });
+
+  it("returns [] when no window mentions a user-count milestone", () => {
+    expect(
+      parseMilestones({
+        recent_windows: [
+          { opened_at: "2026-06-04T08:25:00+08:00", scope: "所有付费计划", title: "事故补偿", summary: "无里程碑" }
+        ]
+      })
+    ).toEqual([]);
+    expect(parseMilestones(null)).toEqual([]);
   });
 });
