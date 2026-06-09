@@ -334,6 +334,24 @@ describe("cadence prior (time-since-last-reset)", () => {
     expect(scoreForecast(s, NOW, resets).chance).toBe(signalOnly);
   });
 
+  it("a moderately irregular cadence earns a low (non-zero) weight", () => {
+    const s = radarSignals();
+    const at = (h: number) => new Date(NOW.getTime() - h * 3_600_000).toISOString();
+    // gaps ≈ [80, 160, 320, 160] h → median 160, CV ≈ 0.63: inside (GOOD, CUTOFF),
+    // so the prior activates but its confidence is throttled by the regularity factor.
+    const resets: ResetRecord[] = [
+      { kind: "reset", at: at(80) },
+      { kind: "reset", at: at(240) },
+      { kind: "reset", at: at(560) },
+      { kind: "reset", at: at(720) },
+      { kind: "reset", at: at(800) }
+    ];
+    const forecast = scoreForecast(s, NOW, resets);
+    expect(forecast.cadence?.confidence ?? 0).toBeGreaterThan(0);
+    expect(forecast.cadence!.confidence).toBeLessThan(0.5);
+    expect(forecast.priorChance).toBeDefined();
+  });
+
   it("ignores non-finite reset timestamps without throwing", () => {
     const s = radarSignals();
     const resets: ResetRecord[] = [

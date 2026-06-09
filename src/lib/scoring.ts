@@ -93,10 +93,10 @@ function agreementBonus(items: ScoredSignal[]): number {
 }
 
 // ── Periodic prior (time-since-last-reset) ────────────────────────────────
-// Adversarially reviewed design: the cadence prior contributes weight ONLY when
-// the logged resets reveal a *validated* regular cadence (enough clean gaps AND
-// low variation). Otherwise wPrior == 0 and the output is byte-for-byte today's
-// signal-only forecast — so a few noisy reset timestamps can never make it worse.
+// The cadence prior's weight scales with how clock-like the logged resets are:
+// full (tempered) weight for a low-variation cadence, a low weight for a ragged
+// event-driven one (its age term only nudges), and zero below MIN_GAPS_FOR_PRIOR
+// or above the CV cutoff — so sparse or chaotic timestamps can never swing it.
 const MU0_HOURS = 168; // weekly prior mean gap — a hand-set belief, dominated by data once gaps accrue
 const SIGMA0_FRAC = 0.5;
 const DELTA_HOURS = 24; // forecast horizon (matches the UI's "next 24h")
@@ -104,7 +104,8 @@ const W_PRIOR_MAX = 0.3; // tempered: the prior nudges, never dominates the live
 const M_FULL = 8; // clean gaps needed for the prior to reach full (tempered) weight
 const GAP_FLOOR_HOURS = 6; // drop physically-impossible gaps (e.g. a double mark-reset)
 const MIN_GAPS_FOR_PRIOR = 4; // need >= 4 clean gaps (>= 5 resets) before any weight
-const REGULARITY_CV_MAX = 0.4; // only a measured low-variation cadence counts as a "clock"
+const REGULARITY_CV_GOOD = 0.4; // at/below this CV the cadence is a clean "clock" → full weight
+const REGULARITY_CV_CUTOFF = 1.0; // at/above this CV the cadence is too chaotic → prior inactive
 const MU_LOW = 0.5 * MU0_HOURS;
 const MU_HIGH = 2 * MU0_HOURS;
 
@@ -221,11 +222,17 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
     computedAt: now.toISOString()
   };
 
-  // Regularity gate: a handful of points is not a clock. Require a *measured*
-  // low-variation cadence before letting the age term move the number at all.
-  if (!Number.isFinite(cv) || cv >= REGULARITY_CV_MAX) {
+  // Regularity → soft weight. A near-perfect cadence (CV ≤ GOOD) earns full
+  // tempered weight; a ragged, event-driven one earns a low weight so its age
+  // term only nudges; at/above CUTOFF the cadence is too chaotic to trust at all.
+  if (!Number.isFinite(cv) || cv >= REGULARITY_CV_CUTOFF) {
     return { pPrior: 0, wPrior: 0, cadence };
   }
+  const regularityFactor = clip(
+    (REGULARITY_CV_CUTOFF - cv) / (REGULARITY_CV_CUTOFF - REGULARITY_CV_GOOD),
+    0,
+    1
+  );
 
   // Bound the cadence so a single missed log can't run the prior off a cliff.
   const muHat = clip(medianGap, MU_LOW, MU_HIGH);
@@ -243,7 +250,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   const fNext = lowerRegularizedGammaP(shape, (ageHours + DELTA_HOURS) / scale);
   const survive = 1 - fNow;
   const pPrior = clip(survive > 1e-9 ? (fNext - fNow) / survive : 1, 1e-3, 1 - 1e-3);
-  const confidence = Math.min(1, m / M_FULL);
+  const confidence = Math.min(1, m / M_FULL) * regularityFactor;
 
   cadence.muHatHours = muHat;
   cadence.sigHatHours = sigHat;

@@ -1,6 +1,8 @@
+import { collectApifySignals } from "./collectors/apify";
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
+import { collectResetHistory } from "./collectors/reset-history";
 import { maybeRecordPrediction, readResets, recordPredictionSnapshot, storeLatestSnapshot } from "./kv";
 import type { ResetRecord } from "./kv";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
@@ -23,6 +25,26 @@ function dedupeSignals(signals: Signal[]): Signal[] {
   }
 
   return deduped;
+}
+
+/**
+ * Merge logged (KV) and radar-derived reset records, dropping near-duplicates
+ * (within 6h) so the same reset counted by both sources can't distort cadence.
+ */
+function mergeResets(a: ResetRecord[], b: ResetRecord[]): ResetRecord[] {
+  const sorted = [...a, ...b]
+    .map((reset) => ({ reset, ms: Date.parse(reset.at) }))
+    .filter((entry) => Number.isFinite(entry.ms))
+    .sort((x, y) => x.ms - y.ms);
+
+  const merged: ResetRecord[] = [];
+  let lastMs = Number.NEGATIVE_INFINITY;
+  for (const { reset, ms } of sorted) {
+    if (ms - lastMs < 6 * 3_600_000) continue;
+    merged.push(reset);
+    lastMs = ms;
+  }
+  return merged;
 }
 
 export function buildSnapshot(
@@ -73,15 +95,35 @@ async function collectWithFallback(
 }
 
 export async function collectSnapshot(): Promise<Snapshot> {
-  const results = await Promise.all([
+  const tasks: Array<Promise<CollectorResult>> = [
     collectWithFallback("openai-status", "OpenAI Status collector failed.", collectOpenAIStatusSignals),
     collectWithFallback("github", "GitHub collector failed.", collectGithubSignals),
     collectWithFallback("codex-reset-radar", "Codex Reset Radar collector failed.", collectResetRadarSignals)
-  ]);
+  ];
+
+  // X/Twitter via Apify is opt-in: only join the snapshot when a token is
+  // configured. Without it the source is simply absent (not a failed
+  // collector), so the forecast never downgrades to "partial" in dev.
+  if (process.env.APIFY_TOKEN) {
+    tasks.push(
+      collectWithFallback("x", "Apify collector failed.", () =>
+        collectApifySignals({
+          token: process.env.APIFY_TOKEN,
+          actorId: process.env.APIFY_ACTOR_ID
+        })
+      )
+    );
+  }
+
+  const results = await Promise.all(tasks);
 
   let resets: ResetRecord[] = [];
   try {
-    resets = await readResets();
+    // Logged resets (manual mark-reset, KV) + fleet-wide official resets parsed
+    // from Codex Reset Radar's recent_windows — merged so the age-since-last-reset
+    // prior has data without anyone hand-marking each reset.
+    const [logged, fromRadar] = await Promise.all([readResets(), collectResetHistory()]);
+    resets = mergeResets(logged, fromRadar);
   } catch {
     resets = [];
   }

@@ -1,11 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { collectApifySignals } from "./collectors/apify";
 import { collectGithubSignals } from "./collectors/github";
 import { collectOpenAIStatusSignals } from "./collectors/openai-status";
 import { collectResetRadarSignals } from "./collectors/reset-radar";
+import { collectResetHistory } from "./collectors/reset-history";
 import { REFRESH_MINUTES_DEFAULT } from "./defaults";
 import { buildSnapshot, collectSnapshot, refreshMinutes } from "./snapshot";
 import type { CollectorStatus, Signal } from "./types";
+
+vi.mock("./collectors/apify", () => ({
+  collectApifySignals: vi.fn()
+}));
 
 vi.mock("./collectors/openai-status", () => ({
   collectOpenAIStatusSignals: vi.fn()
@@ -17,6 +23,10 @@ vi.mock("./collectors/github", () => ({
 
 vi.mock("./collectors/reset-radar", () => ({
   collectResetRadarSignals: vi.fn()
+}));
+
+vi.mock("./collectors/reset-history", () => ({
+  collectResetHistory: vi.fn(() => Promise.resolve([]))
 }));
 
 const NOW = new Date("2026-06-07T12:00:00.000Z");
@@ -188,6 +198,71 @@ describe("collectSnapshot", () => {
     expect(collectResetRadarSignals).toHaveBeenCalledTimes(1);
     expect(snapshot.signals).toEqual([radarSignal]);
     expect(snapshot.collectors.map((collector) => collector.source)).toContain("codex-reset-radar");
+  });
+
+  it("adds the X/Apify source only when APIFY_TOKEN is configured", async () => {
+    vi.mocked(collectOpenAIStatusSignals).mockResolvedValue({
+      status: collectorStatus({ source: "openai-status" }),
+      signals: []
+    });
+    vi.mocked(collectGithubSignals).mockResolvedValue({
+      status: collectorStatus({ source: "github" }),
+      signals: []
+    });
+    vi.mocked(collectResetRadarSignals).mockResolvedValue({
+      status: collectorStatus({ source: "codex-reset-radar" }),
+      signals: []
+    });
+
+    // No token → X is absent and the Apify collector is never invoked.
+    vi.stubEnv("APIFY_TOKEN", "");
+    const withoutToken = await collectSnapshot();
+    expect(collectApifySignals).not.toHaveBeenCalled();
+    expect(withoutToken.collectors.map((collector) => collector.source)).not.toContain("x");
+
+    // Token present → X joins as a real source feeding the forecast.
+    vi.stubEnv("APIFY_TOKEN", "secret-token");
+    const xSignal = signal({ id: "x-signal", source: "x", sourceLabel: "X/Twitter" });
+    vi.mocked(collectApifySignals).mockResolvedValue({
+      status: collectorStatus({ source: "x" }),
+      signals: [xSignal]
+    });
+
+    const withToken = await collectSnapshot();
+    expect(collectApifySignals).toHaveBeenCalledTimes(1);
+    expect(collectApifySignals).toHaveBeenCalledWith(expect.objectContaining({ token: "secret-token" }));
+    expect(withToken.collectors.map((collector) => collector.source)).toContain("x");
+    expect(withToken.signals).toContainEqual(xSignal);
+    expect(withToken.collectors.map((collector) => collector.message).join(" ")).not.toMatch(SECRET_PATTERN);
+  });
+
+  it("feeds radar reset history into the cadence prior", async () => {
+    vi.mocked(collectOpenAIStatusSignals).mockResolvedValue({
+      status: collectorStatus({ source: "openai-status" }),
+      signals: []
+    });
+    vi.mocked(collectGithubSignals).mockResolvedValue({
+      status: collectorStatus({ source: "github" }),
+      signals: []
+    });
+    vi.mocked(collectResetRadarSignals).mockResolvedValue({
+      status: collectorStatus({ source: "codex-reset-radar" }),
+      signals: [signal({ id: "radar-current", source: "codex-reset-radar", strength: 0.4 })]
+    });
+    // A clean, overdue weekly cadence supplied entirely by radar history — no
+    // manual mark-reset — should activate the prior end-to-end.
+    const nowMs = Date.now();
+    const resets = Array.from({ length: 6 }, (_, i) => ({
+      kind: "reset" as const,
+      at: new Date(nowMs - (200 + i * 168) * 3_600_000).toISOString()
+    }));
+    vi.mocked(collectResetHistory).mockResolvedValue(resets);
+
+    const snapshot = await collectSnapshot();
+
+    expect(collectResetHistory).toHaveBeenCalledTimes(1);
+    expect(snapshot.forecast.cadence?.confidence ?? 0).toBeGreaterThan(0);
+    expect(snapshot.forecast.priorChance).toBeDefined();
   });
 });
 
