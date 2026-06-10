@@ -17,3 +17,4 @@ tsconfig.tsbuildinfo
 _mockup/
 xiaohongshu/
 .playwright-mcp/
+.claude/

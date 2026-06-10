@@ -49,12 +49,6 @@ function collectorLabel(collector: CollectorStatus): string {
   return SOURCE_LABELS[collector.source];
 }
 
-/**
- * Build the wave baseline from real probability history. The right edge ("now")
- * is always pinned to the live chance so the wave and the giant readout agree.
- * Sparse history is left-padded with the earliest real value — a calm, honest
- * "not much movement yet" rather than a fabricated spike.
- */
 function buildTrend(trend: number[] | undefined, chance: number): number[] {
   const points = Array.isArray(trend) ? trend.filter((value) => Number.isFinite(value)) : [];
   if (points.length === 0) points.push(chance);
@@ -63,13 +57,9 @@ function buildTrend(trend: number[] | undefined, chance: number): number[] {
   return points;
 }
 
-/**
- * 0 below ~18% (calm indigo), ramping to 1 by ~78% (warm/alert).
- * The wave and the giant readout heat up as a reset looks more imminent.
- */
 function warmthFromChance(chance: number): number {
   const w = Math.min(1, Math.max(0, (chance - 18) / 60));
-  return w * w * (3 - 2 * w); // smoothstep
+  return w * w * (3 - 2 * w);
 }
 
 function mixRgb(cold: readonly number[], warm: readonly number[], t: number): string {
@@ -90,6 +80,89 @@ type MouseState = {
   target: number;
 };
 
+// ── Ambient particle system ────────────────────────────────────────────────
+function useParticles(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
+  useEffect(() => {
+    const cv = canvasRef.current;
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let W = 0;
+    let H = 0;
+
+    const resize = () => {
+      W = window.innerWidth;
+      H = window.innerHeight;
+      cv.width = W * dpr;
+      cv.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resize();
+    window.addEventListener("resize", resize);
+
+    const N = 55;
+    const dots = Array.from({ length: N }, () => ({
+      x: Math.random() * 2000,
+      y: Math.random() * 2000,
+      r: 0.5 + Math.random() * 1.4,
+      vx: (Math.random() - 0.5) * 0.12,
+      vy: -0.06 - Math.random() * 0.1,
+      a: 0.06 + Math.random() * 0.2
+    }));
+
+    const mouse = { x: -9999, y: -9999 };
+    const onMove = (e: PointerEvent) => {
+      mouse.x = e.clientX;
+      mouse.y = e.clientY;
+    };
+    window.addEventListener("pointermove", onMove, { passive: true });
+
+    let raf = 0;
+    const frame = () => {
+      ctx.clearRect(0, 0, W, H);
+      const scrollY = window.scrollY || 0;
+
+      for (const d of dots) {
+        d.x += d.vx;
+        d.y += d.vy;
+        if (d.y < -10) {
+          d.y = H + 10;
+          d.x = Math.random() * W;
+        }
+        if (d.x < -10) d.x = W + 10;
+        if (d.x > W + 10) d.x = -10;
+
+        const dx = d.x - mouse.x;
+        const dy = d.y - mouse.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 150 && dist > 0) {
+          const f = ((150 - dist) / 150) * 0.35;
+          d.x += (dx / dist) * f;
+          d.y += (dy / dist) * f;
+        }
+
+        const parallax = scrollY * (d.r / 4) * 0.015;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y - parallax, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(174,182,255,${d.a})`;
+        ctx.fill();
+      }
+
+      raf = window.requestAnimationFrame(frame);
+    };
+    raf = window.requestAnimationFrame(frame);
+
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.removeEventListener("resize", resize);
+      window.removeEventListener("pointermove", onMove);
+    };
+  }, [canvasRef]);
+}
+
+// ── Main component ─────────────────────────────────────────────────────────
 export function ForecastDashboard({
   initialSnapshot,
   initialHistory = [],
@@ -99,11 +172,13 @@ export function ForecastDashboard({
   const [history, setHistory] = useState<HistoryEntry[]>(initialHistory);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [arrowHidden, setArrowHidden] = useState(false);
 
   const forecast = snapshot.forecast;
   const topSignals = forecast.topSignals;
   const chance = Math.min(100, Math.max(0, Math.round(forecast.chance)));
 
+  const particlesRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const trendRef = useRef<number[]>(buildTrend(initialTrend, chance));
@@ -119,9 +194,21 @@ export function ForecastDashboard({
     target: 0
   });
 
-  // Keep the wave's "now" edge in sync with the latest live chance, and warm the
-  // hero readout's gradient as the chance climbs (set here, not in the RAF loop,
-  // so it also applies under prefers-reduced-motion).
+  // Reveal refs
+  const waveRevealRef = useRef<HTMLElement | null>(null);
+  const signalsRevealRef = useRef<HTMLElement | null>(null);
+  const trackRevealRef = useRef<HTMLElement | null>(null);
+  const footerRevealRef = useRef<HTMLElement | null>(null);
+
+  // Particles
+  const reduce =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  useParticles(reduce ? { current: null } : particlesRef);
+
+  // Warmth sync for hero gradient
   useEffect(() => {
     const points = trendRef.current.slice();
     points[points.length - 1] = chance;
@@ -130,9 +217,56 @@ export function ForecastDashboard({
 
     const warmth = warmthFromChance(chance);
     const root = document.documentElement.style;
-    root.setProperty("--fig-1", `rgb(${mixRgb([207, 212, 255], [255, 216, 196], warmth)})`);
-    root.setProperty("--fig-2", `rgb(${mixRgb([139, 150, 245], [240, 135, 158], warmth)})`);
+    root.setProperty("--fig-mid", `rgb(${mixRgb([208, 213, 255], [255, 216, 196], warmth)})`);
+    root.setProperty("--fig-end", `rgb(${mixRgb([139, 150, 245], [240, 135, 158], warmth)})`);
   }, [chance]);
+
+  // Scroll: hide arrow
+  useEffect(() => {
+    const handler = () => {
+      if (!arrowHidden && window.scrollY > 80) setArrowHidden(true);
+    };
+    window.addEventListener("scroll", handler, { passive: true });
+    return () => window.removeEventListener("scroll", handler);
+  }, [arrowHidden]);
+
+  // Scroll reveal (IntersectionObserver)
+  useEffect(() => {
+    if (typeof IntersectionObserver === "undefined") return;
+
+    const targets = [
+      waveRevealRef.current,
+      signalsRevealRef.current,
+      trackRevealRef.current,
+      footerRevealRef.current
+    ].filter(Boolean) as HTMLElement[];
+    if (targets.length === 0) return;
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("visible");
+            io.unobserve(entry.target);
+          }
+        }
+      },
+      { threshold: 0.08 }
+    );
+    targets.forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, []);
+
+  // Cursor glow (global)
+  useEffect(() => {
+    if (reduce) return;
+    const handler = (e: PointerEvent) => {
+      document.documentElement.style.setProperty("--mx", `${e.clientX}px`);
+      document.documentElement.style.setProperty("--my", `${e.clientY}px`);
+    };
+    window.addEventListener("pointermove", handler, { passive: true });
+    return () => window.removeEventListener("pointermove", handler);
+  }, [reduce]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -145,7 +279,6 @@ export function ForecastDashboard({
       const nextSnapshot = (await response.json()) as Snapshot;
       setSnapshot(nextSnapshot);
 
-      // Append the fresh reading as a new "now" point on the wave.
       const nextChance = Math.min(100, Math.max(0, Math.round(nextSnapshot.forecast.chance)));
       trendRef.current = [...trendRef.current, nextChance].slice(-40);
 
@@ -180,10 +313,6 @@ export function ForecastDashboard({
     if (!ctx) return;
     if (typeof ResizeObserver === "undefined") return;
 
-    const reduce =
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     let width = 1;
     let height = 1;
@@ -194,14 +323,13 @@ export function ForecastDashboard({
       height = Math.max(1, rect.height);
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     resize();
     const observer = new ResizeObserver(resize);
     observer.observe(wrap);
 
     const mouse = mouseRef.current;
-    // The wave only undulates while the cursor is over it; otherwise it holds still.
     const onMove = (event: PointerEvent) => {
       const rect = canvas.getBoundingClientRect();
       mouse.tx = event.clientX - rect.left;
@@ -212,28 +340,52 @@ export function ForecastDashboard({
     const onLeave = () => {
       mouse.target = 0;
     };
-    const onGlow = (event: PointerEvent) => {
-      // Soft ambient glow that trails the cursor across the page.
-      document.documentElement.style.setProperty("--mx", `${event.clientX}px`);
-      document.documentElement.style.setProperty("--my", `${event.clientY}px`);
-    };
     if (!reduce) {
       wrap.addEventListener("pointermove", onMove, { passive: true });
       wrap.addEventListener("pointerleave", onLeave, { passive: true });
-      window.addEventListener("pointermove", onGlow, { passive: true });
     }
 
-    // Three depth-stepped layers: faint back washes, one crisp data wave in front.
-    // Each carries a cold (calm) and warm (imminent) colour, blended by warmth.
     const layers = [
-      { amp: 13, freq: 0.0120, speed: 0.30, off: 0.0, w: 1, cold: [94, 106, 210], warm: [196, 116, 170], a: 0.2, fill: 0.05, depth: 11 },
-      { amp: 20, freq: 0.0082, speed: -0.46, off: 1.7, w: 1.5, cold: [120, 132, 250], warm: [240, 140, 150], a: 0.34, fill: 0.07, depth: 25 },
-      { amp: 30, freq: 0.0058, speed: 0.62, off: 3.1, w: 2.6, cold: [174, 182, 255], warm: [255, 178, 140], a: 0.95, fill: 0.2, depth: 44 }
+      {
+        amp: 16,
+        freq: 0.011,
+        speed: 0.28,
+        off: 0,
+        w: 1,
+        cold: [94, 106, 210] as const,
+        warm: [196, 116, 170] as const,
+        a: 0.16,
+        fill: 0.035,
+        depth: 14
+      },
+      {
+        amp: 26,
+        freq: 0.007,
+        speed: -0.42,
+        off: 1.7,
+        w: 1.6,
+        cold: [120, 132, 250] as const,
+        warm: [240, 140, 150] as const,
+        a: 0.3,
+        fill: 0.06,
+        depth: 28
+      },
+      {
+        amp: 38,
+        freq: 0.005,
+        speed: 0.56,
+        off: 3.1,
+        w: 2.8,
+        cold: [174, 182, 255] as const,
+        warm: [255, 178, 140] as const,
+        a: 0.88,
+        fill: 0.16,
+        depth: 48
+      }
     ];
 
     const clampIndex = (index: number, max: number) => Math.max(0, Math.min(max, index));
 
-    // Round the Y-axis ceiling up to a tidy probability scale (min 40%).
     const niceMax = (peak: number) => {
       const target = Math.max(peak, 1) * 1.2;
       for (const m of [40, 60, 80, 100]) if (m >= target) return m;
@@ -245,8 +397,6 @@ export function ForecastDashboard({
     let lastDraw = -1;
 
     const render = () => {
-      // Ease the cursor and advance the wave phase ONLY while engaged, so the
-      // wave is perfectly still at rest and undulates only under the cursor.
       mouse.x += (mouse.tx - mouse.x) * 0.12;
       mouse.y += (mouse.ty - mouse.y) * 0.12;
       mouse.nx += (mouse.tnx - mouse.nx) * 0.12;
@@ -259,10 +409,9 @@ export function ForecastDashboard({
       const yMax = niceMax(peak);
       const warmth = warmthFromChance(chanceRef.current);
 
-      // Plot area leaves a left gutter for the Y axis and breathing room top/bottom.
-      const plotL = 46;
-      const plotT = height * 0.16;
-      const plotB = height * 0.88;
+      const plotL = 50;
+      const plotT = height * 0.12;
+      const plotB = height * 0.9;
       const plotW = Math.max(1, width - plotL);
       const levelAt = (v: number) => plotB - (v / yMax) * (plotB - plotT);
       const baseAt = (x: number) => {
@@ -273,102 +422,103 @@ export function ForecastDashboard({
         const tt = f - i;
         const a = points[clampIndex(i, n - 1)];
         const b = points[clampIndex(i + 1, n - 1)];
-        const v = a + (b - a) * (tt * tt * (3 - 2 * tt)); // smoothstep
+        const v = a + (b - a) * (tt * tt * (3 - 2 * tt));
         return levelAt(v);
       };
 
-      ctx.clearRect(0, 0, width, height);
+      ctx!.clearRect(0, 0, width, height);
 
-      // Y axis — probability scale with gridlines and labels.
-      ctx.font = "500 12px 'JetBrains Mono', ui-monospace, monospace";
-      ctx.textBaseline = "middle";
-      ctx.textAlign = "right";
+      // Y axis
+      ctx!.font = "500 11px 'JetBrains Mono', ui-monospace, monospace";
+      ctx!.textBaseline = "middle";
+      ctx!.textAlign = "right";
       for (const v of [0, yMax / 2, yMax]) {
         const gy = levelAt(v);
-        ctx.strokeStyle = v === 0 ? "rgba(255,255,255,0.09)" : "rgba(255,255,255,0.045)";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(plotL, gy);
-        ctx.lineTo(width, gy);
-        ctx.stroke();
-        ctx.fillStyle = "rgba(255,255,255,0.34)";
-        ctx.fillText(`${v}%`, plotL - 10, gy);
+        ctx!.strokeStyle = v === 0 ? "rgba(255,255,255,0.07)" : "rgba(255,255,255,0.03)";
+        ctx!.lineWidth = 1;
+        ctx!.beginPath();
+        ctx!.moveTo(plotL, gy);
+        ctx!.lineTo(width, gy);
+        ctx!.stroke();
+        ctx!.fillStyle = "rgba(255,255,255,0.28)";
+        ctx!.fillText(`${v}%`, plotL - 10, gy);
       }
 
-      const sigma = Math.max(90, plotW * 0.12);
-      const globalAmp = 0.55 + (1 - mouse.y) * 0.6 * mouse.active;
+      const sigma = Math.max(100, plotW * 0.13);
+      const globalAmp = 0.5 + (1 - mouse.y) * 0.65 * mouse.active;
 
       const yAt = (x: number, layer: (typeof layers)[number], parallax: number) => {
         const sx = x - parallax;
         const flow = Math.sin(sx * layer.freq + phase * layer.speed + layer.off) * layer.amp;
         const dx = x - mouse.x;
-        const swell = -Math.exp(-(dx * dx) / (2 * sigma * sigma)) * (30 + layer.depth * 0.28) * mouse.active;
+        const swell =
+          -Math.exp(-(dx * dx) / (2 * sigma * sigma)) *
+          (34 + layer.depth * 0.3) *
+          mouse.active;
         const y = baseAt(sx) + flow * globalAmp + swell;
         return Math.max(6, Math.min(height - 2, y));
       };
 
       layers.forEach((layer, li) => {
-        const parallax = mouse.nx * layer.depth * mouse.active; // pseudo-3D depth
+        const parallax = mouse.nx * layer.depth * mouse.active;
         const col = mixRgb(layer.cold, layer.warm, warmth);
-        const fill = layer.fill * (1 + warmth * 0.5);
+        const fillAlpha = layer.fill * (1 + warmth * 0.5);
 
-        // Area fill down to the 0% baseline.
-        ctx.beginPath();
+        // Area fill
+        ctx!.beginPath();
         for (let x = plotL; x <= width; x += 2) {
           const y = yAt(x, layer, parallax);
-          if (x === plotL) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+          if (x === plotL) ctx!.moveTo(x, y);
+          else ctx!.lineTo(x, y);
         }
-        ctx.lineTo(width, plotB);
-        ctx.lineTo(plotL, plotB);
-        ctx.closePath();
-        const gradient = ctx.createLinearGradient(0, plotT, 0, plotB);
-        gradient.addColorStop(0, `rgba(${col},${fill})`);
+        ctx!.lineTo(width, plotB);
+        ctx!.lineTo(plotL, plotB);
+        ctx!.closePath();
+        const gradient = ctx!.createLinearGradient(0, plotT, 0, plotB);
+        gradient.addColorStop(0, `rgba(${col},${fillAlpha})`);
         gradient.addColorStop(1, `rgba(${col},0)`);
-        ctx.fillStyle = gradient;
-        ctx.fill();
+        ctx!.fillStyle = gradient;
+        ctx!.fill();
 
-        // Crest line.
-        ctx.beginPath();
+        // Crest line
+        ctx!.beginPath();
         for (let x = plotL; x <= width; x += 2) {
           const y = yAt(x, layer, parallax);
-          if (x === plotL) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+          if (x === plotL) ctx!.moveTo(x, y);
+          else ctx!.lineTo(x, y);
         }
-        ctx.strokeStyle = `rgba(${col},${layer.a})`;
-        ctx.lineWidth = layer.w;
+        ctx!.strokeStyle = `rgba(${col},${layer.a})`;
+        ctx!.lineWidth = layer.w;
         if (li === layers.length - 1) {
-          ctx.shadowColor = `rgba(${mixRgb([130, 143, 255], [255, 150, 120], warmth)},0.6)`;
-          ctx.shadowBlur = 15 + warmth * 9;
+          ctx!.shadowColor = `rgba(${mixRgb([130, 143, 255], [255, 150, 120], warmth)},0.55)`;
+          ctx!.shadowBlur = 18 + warmth * 9;
         }
-        ctx.stroke();
-        ctx.shadowBlur = 0;
+        ctx!.stroke();
+        ctx!.shadowBlur = 0;
       });
 
-      // "Now" marker on the front wave.
+      // "Now" marker
       const front = layers[layers.length - 1];
       const yNow = yAt(width, front, 0);
       const guideCol = mixRgb([174, 182, 255], [255, 180, 150], warmth);
-      ctx.strokeStyle = `rgba(${guideCol},0.22)`;
-      ctx.setLineDash([2, 5]);
-      ctx.beginPath();
-      ctx.moveTo(width - 1, yNow);
-      ctx.lineTo(width - 1, plotB);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      ctx!.strokeStyle = `rgba(${guideCol},0.18)`;
+      ctx!.setLineDash([2, 5]);
+      ctx!.beginPath();
+      ctx!.moveTo(width - 1, yNow);
+      ctx!.lineTo(width - 1, plotB);
+      ctx!.stroke();
+      ctx!.setLineDash([]);
 
-      const pulse = 4.2 + Math.sin(phase * 1.6) * 0.8 * mouse.active;
-      ctx.beginPath();
-      ctx.arc(width - 2, yNow, pulse, 0, Math.PI * 2);
-      ctx.fillStyle = `rgb(${mixRgb([207, 212, 255], [255, 214, 184], warmth)})`;
-      ctx.shadowColor = `rgba(${guideCol},0.9)`;
-      ctx.shadowBlur = 16 + warmth * 8;
-      ctx.fill();
-      ctx.shadowBlur = 0;
+      const dotSize = 4.5 + Math.sin(phase * 1.6) * 0.9 * mouse.active;
+      ctx!.beginPath();
+      ctx!.arc(width - 2, yNow, dotSize, 0, Math.PI * 2);
+      ctx!.fillStyle = `rgb(${mixRgb([207, 212, 255], [255, 214, 184], warmth)})`;
+      ctx!.shadowColor = `rgba(${guideCol},0.9)`;
+      ctx!.shadowBlur = 20 + warmth * 8;
+      ctx!.fill();
+      ctx!.shadowBlur = 0;
     };
 
-    // Full-rate while engaged or settling; otherwise redraw only a couple of
-    // times a second to pick up data/colour changes — the wave itself stays still.
     const loop = (ts: number) => {
       const engaged = mouse.active > 0.002 || mouse.target > 0;
       if (engaged || lastDraw < 0 || ts - lastDraw > 400) {
@@ -390,10 +540,9 @@ export function ForecastDashboard({
       if (!reduce) {
         wrap.removeEventListener("pointermove", onMove);
         wrap.removeEventListener("pointerleave", onLeave);
-        window.removeEventListener("pointermove", onGlow);
       }
     };
-  }, []);
+  }, [reduce]);
 
   const okCollectors = useMemo(
     () => snapshot.collectors.filter((collector) => collector.ok).length,
@@ -401,148 +550,197 @@ export function ForecastDashboard({
   );
 
   return (
-    <main className="stage">
+    <>
+      {/* Fixed background layers */}
+      <canvas ref={particlesRef} className="particles-canvas" aria-hidden="true" />
+      <div className="atmosphere" aria-hidden="true" />
       <div className="cursor-glow" aria-hidden="true" />
 
-      <header className="masthead">
-        <span className="wordmark">Codex Reset Oracle</span>
-        <span className={`live live-${forecast.status}`}>
-          <span className="live-dot" aria-hidden="true" />
-          {STATUS_LABELS[forecast.status]} · Unofficial
-        </span>
-      </header>
-
-      <section className="hero" aria-labelledby="forecast-title">
-        <p className="eyebrow">Reset chance · next 24h</p>
-        <div
-          className="readout"
-          role="img"
-          aria-label={`Codex reset chance ${chance}% in the next 24 hours`}
-        >
-          <span className="figure">{chance}</span>
-          <span className="unit">%</span>
-        </div>
-        <h1 id="forecast-title" className="headline">
-          Codex Reset Chance
-        </h1>
-        <p className="lede">{forecast.summary}</p>
-        <div className="window-pill">
-          <span className="window-tick" aria-hidden="true" />
-          {forecast.window}
-        </div>
-      </section>
-
-      <section className="waveband" aria-label="Probability trend, last 30 hours">
-        <div className="waveband-head">
-          <span>Probability · last 30h</span>
-          <span className="waveband-hint">move cursor to disturb</span>
-        </div>
-        <div className="wave-wrap" ref={wrapRef}>
-          <canvas ref={canvasRef} className="wave-canvas" />
-        </div>
-        <div className="wave-axis">
-          <span>30h ago</span>
-          <span>24h</span>
-          <span>18h</span>
-          <span>12h</span>
-          <span>6h</span>
-          <span>now</span>
-        </div>
-      </section>
-
-      <section className="signals" aria-labelledby="signals-title">
-        <div className="row-head">
-          <span className="row-kicker">Evidence</span>
-          <h2 id="signals-title">Top signals</h2>
-        </div>
-
-        {topSignals.length === 0 ? (
-          <p className="empty">No matching public signals right now. Refresh to re-check the sources.</p>
-        ) : (
-          <ul className="signal-list">
-            {topSignals.map((signal) => (
-              <li key={signal.id}>
-                <a
-                  className="signal-row"
-                  href={signal.url}
-                  rel="noreferrer"
-                  target="_blank"
-                  aria-label={`Open ${signal.sourceLabel} signal: ${signal.title}`}
-                >
-                  <span className="signal-source">{signal.sourceLabel}</span>
-                  <span className="signal-body">
-                    <span className="signal-title">{signal.title}</span>
-                    {signal.reason ? <span className="signal-detail">{signal.reason}</span> : null}
-                  </span>
-                  <span className="signal-when" suppressHydrationWarning>
-                    {formatRelative(signal.publishedAt)}
-                  </span>
-                </a>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {history.length > 0 ? (
-        <section className="track" aria-labelledby="track-title">
-          <div className="row-head">
-            <span className="row-kicker">Track record</span>
-            <h2 id="track-title">Logged events</h2>
-          </div>
-          <ul className="track-list">
-            {history.slice(0, 6).map((entry, index) => (
-              <li className={`track-row track-${entry.kind}`} key={`${entry.kind}-${entry.at}-${index}`}>
-                <span className="track-tag">
-                  {entry.kind === "prediction" ? `Predicted ${entry.chance}%` : "Actual reset"}
-                </span>
-                <span className="track-time" suppressHydrationWarning>
-                  {formatGeneratedAt(entry.at)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-
-      <footer className="ground">
-        <div className="sources" aria-label="Source pipeline status">
-          {snapshot.collectors.length === 0 ? (
-            <span className="sources-empty">Sources report after the first refresh.</span>
-          ) : (
-            snapshot.collectors.map((collector) => (
-              <span className="source-chip" key={collector.source}>
-                <span
-                  className={`source-dot ${collector.ok ? "is-ok" : "is-fail"}`}
-                  aria-hidden="true"
-                />
-                {collectorLabel(collector)}
-              </span>
-            ))
-          )}
-        </div>
-
-        <div className="ground-actions">
-          <span className="updated" suppressHydrationWarning>
-            Updated {formatGeneratedAt(forecast.generatedAt)} · {okCollectors}/
-            {snapshot.collectors.length || 3} sources
+      <div className="content">
+        {/* Fixed nav */}
+        <header className="masthead">
+          <span className="wordmark">Codex Reset Oracle</span>
+          <span className={`live live-${forecast.status}`}>
+            <span className="live-dot" aria-hidden="true" />
+            {STATUS_LABELS[forecast.status]} · Unofficial
           </span>
-          <button type="button" className="refresh" onClick={refresh} disabled={loading}>
-            {loading ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
+        </header>
 
-        {error ? (
-          <p className="refresh-error" role="status">
-            {error}
-          </p>
+        {/* ═══ Screen 1: Hero — pure impact, no charts ═══ */}
+        <section className="screen-hero" aria-labelledby="forecast-title">
+          <div className="hero-inner">
+            <p className="hero-eyebrow">Reset Probability · Next 24 Hours</p>
+            <div
+              className="hero-readout"
+              role="img"
+              aria-label={`Codex reset chance ${chance}% in the next 24 hours`}
+            >
+              <span className="hero-figure">{chance}</span>
+              <span className="hero-unit">%</span>
+            </div>
+            <h1 id="forecast-title" className="hero-headline">
+              Codex Reset Chance
+            </h1>
+            <p className="hero-sub">{forecast.summary}</p>
+            <div className="hero-window">
+              <span className="hero-window-dot" aria-hidden="true" />
+              {forecast.window}
+            </div>
+          </div>
+          <div className={`scroll-arrow ${arrowHidden ? "hidden" : ""}`} aria-hidden="true">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M3 6l5 5 5-5" />
+            </svg>
+          </div>
+        </section>
+
+        {/* ═══ Screen 2: Wave — the data spectacle ═══ */}
+        <section
+          className="screen-wave reveal"
+          ref={waveRevealRef}
+          aria-label="Probability trend, last 30 hours"
+        >
+          <div className="wave-head">
+            <div className="wave-head-left">
+              <span className="wave-label">Trend</span>
+              <span className="wave-title">Probability · Last 30h</span>
+            </div>
+            <span className="wave-hint">move cursor to disturb</span>
+          </div>
+          <div className="wave-wrap" ref={wrapRef}>
+            <canvas ref={canvasRef} className="wave-canvas" />
+          </div>
+          <div className="wave-axis">
+            <span>30h</span>
+            <span>24h</span>
+            <span>18h</span>
+            <span>12h</span>
+            <span>6h</span>
+            <span>now</span>
+          </div>
+        </section>
+
+        {/* ═══ Screen 3: Signals ═══ */}
+        <section
+          className="screen-signals reveal"
+          ref={signalsRevealRef}
+          aria-labelledby="signals-title"
+        >
+          <p className="section-label">Evidence</p>
+          <h2 id="signals-title" className="section-title">
+            Top Signals
+          </h2>
+
+          {topSignals.length === 0 ? (
+            <p className="empty">
+              No matching public signals right now. Refresh to re-check the sources.
+            </p>
+          ) : (
+            <ul className="signal-list">
+              {topSignals.map((signal) => (
+                <li key={signal.id}>
+                  <a
+                    className="signal-row"
+                    href={signal.url}
+                    rel="noreferrer"
+                    target="_blank"
+                    aria-label={`Open ${signal.sourceLabel} signal: ${signal.title}`}
+                  >
+                    <span className="signal-source">{signal.sourceLabel}</span>
+                    <span className="signal-body">
+                      <span className="signal-title">{signal.title}</span>
+                      {signal.reason ? (
+                        <span className="signal-detail">{signal.reason}</span>
+                      ) : null}
+                    </span>
+                    <span className="signal-when" suppressHydrationWarning>
+                      {formatRelative(signal.publishedAt)}
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        {/* Track record */}
+        {history.length > 0 ? (
+          <section
+            className="track reveal"
+            ref={trackRevealRef}
+            aria-labelledby="track-title"
+          >
+            <p className="section-label">Track Record</p>
+            <h2 id="track-title" className="section-title">
+              Logged Events
+            </h2>
+            <ul className="track-list">
+              {history.slice(0, 6).map((entry, index) => (
+                <li
+                  className={`track-row track-${entry.kind}`}
+                  key={`${entry.kind}-${entry.at}-${index}`}
+                >
+                  <span className="track-tag">
+                    {entry.kind === "prediction"
+                      ? `Predicted ${entry.chance}%`
+                      : "Actual reset"}
+                  </span>
+                  <span className="track-time" suppressHydrationWarning>
+                    {formatGeneratedAt(entry.at)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
         ) : null}
 
-        <p className="disclaimer">
-          Unofficial project. Not affiliated with OpenAI. Forecasts are estimates from public
-          signals, not official notices.
-        </p>
-      </footer>
-    </main>
+        {/* Footer */}
+        <footer className="ground reveal" ref={footerRevealRef}>
+          <div className="sources" aria-label="Source pipeline status">
+            {snapshot.collectors.length === 0 ? (
+              <span className="sources-empty">
+                Sources report after the first refresh.
+              </span>
+            ) : (
+              snapshot.collectors.map((collector) => (
+                <span className="source-chip" key={collector.source}>
+                  <span
+                    className={`source-dot ${collector.ok ? "is-ok" : "is-fail"}`}
+                    aria-hidden="true"
+                  />
+                  {collectorLabel(collector)}
+                </span>
+              ))
+            )}
+          </div>
+
+          <div className="ground-actions">
+            <span className="updated" suppressHydrationWarning>
+              Updated {formatGeneratedAt(forecast.generatedAt)} · {okCollectors}/
+              {snapshot.collectors.length || 3} sources
+            </span>
+            <button
+              type="button"
+              className="refresh"
+              onClick={refresh}
+              disabled={loading}
+            >
+              {loading ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          {error ? (
+            <p className="refresh-error" role="status">
+              {error}
+            </p>
+          ) : null}
+
+          <p className="disclaimer">
+            Unofficial project. Not affiliated with OpenAI. Forecasts are estimates from
+            public signals, not official notices.
+          </p>
+        </footer>
+      </div>
+    </>
   );
 }
