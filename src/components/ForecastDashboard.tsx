@@ -195,7 +195,7 @@ export function ForecastDashboard({
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     let W = 0;
     let H = 0;
-    const N = 900;
+    const N = 1300;
     const P: Array<{
       ang: number;
       rad: number;
@@ -207,6 +207,8 @@ export function ForecastDashboard({
       ay: number;
       role: string;
       glow: number;
+      txX: number; // hero target — a point on the CODEX glyph cloud
+      txY: number;
     }> = [];
     for (let k = 0; k < N; k += 1) {
       P.push({
@@ -219,9 +221,53 @@ export function ForecastDashboard({
         ax: 0,
         ay: 0,
         role: "haze",
-        glow: 0.2
+        glow: 0.2,
+        txX: 0,
+        txY: 0
       });
     }
+
+    // Sample the word CODEX into a point cloud — the hero particles settle into
+    // these glyph points (then morph into the axis on scroll).
+    const TEXT_CX = () => W * 0.61;
+    const TEXT_CY = () => H * 0.36;
+    const sampleCodex = () => {
+      const off = document.createElement("canvas");
+      off.width = W;
+      off.height = H;
+      const octx = off.getContext("2d");
+      if (!octx) return;
+      const fontPx = Math.min(W * 0.068, 100);
+      octx.fillStyle = "#fff";
+      octx.font = `900 ${fontPx}px Inter, system-ui, sans-serif`;
+      octx.textAlign = "center";
+      octx.textBaseline = "middle";
+      octx.fillText("CODEX", TEXT_CX(), TEXT_CY());
+      let data: Uint8ClampedArray;
+      try {
+        data = octx.getImageData(0, 0, W, H).data;
+      } catch {
+        return;
+      }
+      const pts: Array<{ x: number; y: number }> = [];
+      const step = 6;
+      for (let y = 0; y < H; y += step) {
+        for (let x = 0; x < W; x += step) {
+          if (data[(y * W + x) * 4 + 3] > 110) pts.push({ x, y });
+        }
+      }
+      if (pts.length === 0) return;
+      // Shuffle so particles fill the whole word evenly even when N differs.
+      for (let k = N - 1; k > 0; k -= 1) {
+        const j = Math.floor(Math.random() * (k + 1));
+        [P[k], P[j]] = [P[j], P[k]];
+      }
+      for (let k = 0; k < N; k += 1) {
+        const tp = pts[k % pts.length];
+        P[k].txX = tp.x;
+        P[k].txY = tp.y;
+      }
+    };
 
     const plot = { l: 0, r: 0, t: 0, b: 0, w: 0, h: 0 };
     const px = (tf: number) => plot.l + tf * plot.w;
@@ -229,7 +275,7 @@ export function ForecastDashboard({
 
     const recompute = () => {
       plot.l = W * 0.1;
-      plot.r = W * 0.93;
+      plot.r = W * 0.9; // leave room on the right for the "current" price tag
       plot.t = H * 0.3;
       plot.b = H * 0.84;
       plot.w = plot.r - plot.l;
@@ -299,6 +345,7 @@ export function ForecastDashboard({
       cv.height = Math.round(H * dpr);
       ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
       recompute();
+      sampleCodex();
     };
     resize();
     window.addEventListener("resize", resize);
@@ -306,10 +353,15 @@ export function ForecastDashboard({
     let prog = 0;
     let progT = 0;
     const onScroll = () => {
-      const start = window.innerHeight * 0.5;
-      const spanPx = window.innerHeight * 0.9;
+      const vh = window.innerHeight;
+      const start = vh * 0.5;
+      const spanPx = vh * 0.9;
       progT = clamp01((window.scrollY - start) / spanPx);
       if (window.scrollY > 80) setScrolled(true);
+      // Fade the field out before the Forecast Board scrolls in, so the axis
+      // never bleeds over the footer (whose width is capped). axis-screen ends
+      // at ~3.1vh; fade across 2.3–3.0vh.
+      cv.style.opacity = String(clamp01(1 - (window.scrollY - vh * 2.3) / (vh * 0.7)));
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     onScroll();
@@ -337,10 +389,7 @@ export function ForecastDashboard({
       c.closePath();
     };
 
-    const TCX = () => W * 0.67;
-    const TCY = () => H * 0.34;
     let t = 0;
-    let spin = 0;
     let raf = 0;
 
     const drawAxis = (la: number) => {
@@ -450,64 +499,108 @@ export function ForecastDashboard({
         ctx!.fillText(nd.label, x, y - 45);
       }
 
-      // current callout anchored to the curve end (= live chance)
+      // ── Current readout: a living pulse on the curve end + a price tag
+      //    pinned in the right gutter, so the number never sits under the dot. ──
       const cxp = px(1);
       const cyp = py(hasCurve ? valueAt(curve, 1) : cur / 100);
+
+      // expanding pulse rings (the forecast is "live")
+      for (let ri = 0; ri < 2; ri += 1) {
+        const pr = (t * 0.55 + ri * 0.5) % 1;
+        ctx!.strokeStyle = `rgba(139,150,255,${(1 - pr) * 0.5 * la})`;
+        ctx!.lineWidth = 1.5;
+        ctx!.beginPath();
+        ctx!.arc(cxp, cyp, 5 + pr * 26, 0, 6.2832);
+        ctx!.stroke();
+      }
+      // glowing node
       ctx!.save();
-      ctx!.shadowColor = `rgba(139,150,255,${la})`;
-      ctx!.shadowBlur = 22;
-      ctx!.fillStyle = `rgba(232,236,255,${la})`;
+      ctx!.shadowColor = `rgba(160,170,255,${la})`;
+      ctx!.shadowBlur = 18;
+      ctx!.fillStyle = `rgba(236,239,255,${la})`;
       ctx!.beginPath();
-      ctx!.arc(cxp, cyp, 7, 0, 6.2832);
+      ctx!.arc(cxp, cyp, 5, 0, 6.2832);
       ctx!.fill();
       ctx!.restore();
-      ctx!.fillStyle = `rgba(124,137,240,${0.18 * la})`;
-      roundRect(ctx!, cxp - 82, cyp - 64, 74, 40, 9);
-      ctx!.fill();
-      ctx!.strokeStyle = `rgba(139,150,255,${0.5 * la})`;
+
+      // horizontal guide to the tag in the right gutter
+      const tagW = 96;
+      const tagH = 52;
+      const tagX = Math.min(W - tagW - 12, cxp + 24);
+      const tagY = Math.max(plot.t, Math.min(plot.b - tagH, cyp - tagH / 2));
+      ctx!.strokeStyle = `rgba(139,150,255,${0.4 * la})`;
       ctx!.lineWidth = 1;
+      ctx!.setLineDash([2, 5]);
+      ctx!.beginPath();
+      ctx!.moveTo(cxp + 7, cyp);
+      ctx!.lineTo(tagX, cyp);
       ctx!.stroke();
+      ctx!.setLineDash([]);
+
+      // tag card with a pointer notch toward the curve
+      ctx!.save();
+      ctx!.shadowColor = `rgba(108,120,240,${0.55 * la})`;
+      ctx!.shadowBlur = 22;
+      ctx!.fillStyle = `rgba(12,14,26,${0.95 * la})`;
+      roundRect(ctx!, tagX, tagY, tagW, tagH, 12);
+      ctx!.fill();
+      ctx!.restore();
+      ctx!.strokeStyle = `rgba(139,150,255,${0.6 * la})`;
+      ctx!.lineWidth = 1.25;
+      roundRect(ctx!, tagX, tagY, tagW, tagH, 12);
+      ctx!.stroke();
+      ctx!.fillStyle = `rgba(12,14,26,${0.95 * la})`;
+      ctx!.beginPath();
+      ctx!.moveTo(tagX + 1, cyp - 6);
+      ctx!.lineTo(tagX - 7, cyp);
+      ctx!.lineTo(tagX + 1, cyp + 6);
+      ctx!.closePath();
+      ctx!.fill();
+
+      // big number + label + accent underline
       ctx!.fillStyle = `rgba(236,239,255,${la})`;
-      ctx!.font = "800 22px Inter, sans-serif";
+      ctx!.font = "800 27px Inter, sans-serif";
       ctx!.textAlign = "center";
       ctx!.textBaseline = "middle";
-      ctx!.fillText(`${cur}%`, cxp - 45, cyp - 47);
+      ctx!.fillText(`${cur}%`, tagX + tagW / 2, tagY + tagH * 0.4);
       ctx!.font = "600 8px 'JetBrains Mono', monospace";
-      ctx!.fillStyle = `rgba(176,184,255,${0.85 * la})`;
-      ctx!.fillText("CURRENT", cxp - 45, cyp - 33);
+      ctx!.fillStyle = `rgba(176,184,255,${0.9 * la})`;
+      ctx!.fillText("CURRENT", tagX + tagW / 2, tagY + tagH * 0.72);
+      ctx!.strokeStyle = `rgba(139,150,255,${0.75 * la})`;
+      ctx!.lineWidth = 2;
+      ctx!.beginPath();
+      ctx!.moveTo(tagX + tagW * 0.32, tagY + tagH - 9);
+      ctx!.lineTo(tagX + tagW * 0.68, tagY + tagH - 9);
+      ctx!.stroke();
     };
 
     const frame = () => {
       t += 0.016;
-      spin += 0.0011;
       prog += (progT - prog) * 0.08;
       const e = ease(prog);
-      const R = Math.min(W, H) * 0.24;
-      const cx0 = TCX();
-      const cy0 = TCY();
 
       ctx!.clearRect(0, 0, W, H);
       ctx!.globalCompositeOperation = "lighter";
 
+      // Soft halo behind the CODEX word, fading as the cloud morphs to the axis.
       if (e < 0.6) {
         const coreA = 1 - e / 0.6;
-        const cr = R * 0.55 * (1 + Math.sin(t * 1.1) * 0.06);
-        const g = ctx!.createRadialGradient(cx0, cy0, 0, cx0, cy0, cr);
-        g.addColorStop(0, `rgba(170,182,255,${0.42 * coreA})`);
-        g.addColorStop(0.4, `rgba(120,132,250,${0.18 * coreA})`);
+        const cr = Math.min(W, H) * 0.27 * (1 + Math.sin(t * 1.1) * 0.05);
+        const g = ctx!.createRadialGradient(TEXT_CX(), TEXT_CY(), 0, TEXT_CX(), TEXT_CY(), cr);
+        g.addColorStop(0, `rgba(120,132,250,${0.13 * coreA})`);
         g.addColorStop(1, "rgba(108,120,240,0)");
         ctx!.fillStyle = g;
         ctx!.beginPath();
-        ctx!.arc(cx0, cy0, cr, 0, 6.2832);
+        ctx!.arc(TEXT_CX(), TEXT_CY(), cr, 0, 6.2832);
         ctx!.fill();
       }
 
       for (const p of P) {
-        const a = p.ang + t * p.speed * 0.25 + spin;
-        const tx = cx0 + Math.cos(a) * R * p.rad;
-        const ty = cy0 + Math.sin(a) * R * p.rad * p.tilt + Math.sin(t * 0.6 + p.phase) * 6;
-        let x = tx + (p.ax - tx) * e;
-        let y = ty + (p.ay - ty) * e;
+        // hero: rest on the CODEX glyph with a soft shimmer; morph to axis by e
+        const hx = p.txX + Math.sin(t * 0.9 + p.phase) * 1.6;
+        const hy = p.txY + Math.cos(t * 0.8 + p.phase) * 1.6;
+        let x = hx + (p.ax - hx) * e;
+        let y = hy + (p.ay - hy) * e;
         const dx = x - mouse.x;
         const dy = y - mouse.y;
         const d2 = dx * dx + dy * dy;
