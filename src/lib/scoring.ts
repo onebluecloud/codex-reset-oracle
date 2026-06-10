@@ -4,6 +4,9 @@ import type { OracleModel } from "./model";
 import type {
   AnySource,
   AuxSignal,
+  BoardDirection,
+  BoardRow,
+  BoardStatus,
   Cadence,
   Forecast,
   ForecastFeatures,
@@ -232,6 +235,9 @@ type PriorResult = {
   cadence: Cadence | null;
   /** Hours since the last known fleet-wide reset (null when no resets known). */
   ageHours: number | null;
+  /** Fitted Gamma shape/scale — lets the board read the hazard at any horizon. */
+  shape: number | null;
+  scale: number | null;
 };
 
 function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
@@ -240,16 +246,16 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
     .filter((value) => Number.isFinite(value))
     .sort((a, b) => a - b);
   const n = times.length;
-  if (n === 0) return { pPrior: 0, wPrior: 0, cadence: null, ageHours: null };
+  if (n === 0) return { pPrior: 0, wPrior: 0, cadence: null, ageHours: null, shape: null, scale: null };
 
   const ageHours = Math.max(0, (now.getTime() - times[n - 1]) / 3_600_000);
-  if (n < 2) return { pPrior: 0, wPrior: 0, cadence: null, ageHours };
+  if (n < 2) return { pPrior: 0, wPrior: 0, cadence: null, ageHours, shape: null, scale: null };
 
   const gaps: number[] = [];
   for (let i = 1; i < n; i += 1) gaps.push((times[i] - times[i - 1]) / 3_600_000);
   const cleanGaps = gaps.filter((gap) => gap >= GAP_FLOOR_HOURS);
   const m = cleanGaps.length;
-  if (m < MIN_GAPS_FOR_PRIOR) return { pPrior: 0, wPrior: 0, cadence: null, ageHours };
+  if (m < MIN_GAPS_FOR_PRIOR) return { pPrior: 0, wPrior: 0, cadence: null, ageHours, shape: null, scale: null };
 
   const medianGap = median(cleanGaps);
   const std = sampleStd(cleanGaps);
@@ -268,7 +274,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   // tempered weight; a ragged, event-driven one earns a low weight so its age
   // term only nudges; at/above CUTOFF the cadence is too chaotic to trust at all.
   if (!Number.isFinite(cv) || cv >= REGULARITY_CV_CUTOFF) {
-    return { pPrior: 0, wPrior: 0, cadence, ageHours };
+    return { pPrior: 0, wPrior: 0, cadence, ageHours, shape: null, scale: null };
   }
   const regularityFactor = clip(
     (REGULARITY_CV_CUTOFF - cv) / (REGULARITY_CV_CUTOFF - REGULARITY_CV_GOOD),
@@ -284,7 +290,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   const shape = (muHat * muHat) / (sigHat * sigHat);
   const scale = (sigHat * sigHat) / muHat;
   if (!Number.isFinite(shape) || !Number.isFinite(scale) || shape <= 0 || scale <= 0) {
-    return { pPrior: 0, wPrior: 0, cadence, ageHours };
+    return { pPrior: 0, wPrior: 0, cadence, ageHours, shape: null, scale: null };
   }
 
   // P(reset within next 24h | survived ageHours since the last reset).
@@ -298,10 +304,37 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   cadence.sigHatHours = sigHat;
   cadence.confidence = confidence;
 
-  return { pPrior, wPrior: W_PRIOR_MAX * confidence, cadence, ageHours };
+  return { pPrior, wPrior: W_PRIOR_MAX * confidence, cadence, ageHours, shape, scale };
 }
 
-type MilestoneResult = { pMilestone: number; wMilestone: number };
+/**
+ * P(reset within the next `horizonHours` | survived `ageHours`) from the fitted
+ * Gamma cadence — the same age-conditioned hazard periodicPrior uses for 24h,
+ * read at an arbitrary horizon so the board can show 48h / 7-day windows.
+ * Returns null when no cadence is fitted (caller falls back to a compounding
+ * estimate).
+ */
+function hazardWithin(
+  shape: number | null,
+  scale: number | null,
+  ageHours: number | null,
+  horizonHours: number
+): number | null {
+  if (shape === null || scale === null || ageHours === null) return null;
+  const fNow = lowerRegularizedGammaP(shape, ageHours / scale);
+  const fNext = lowerRegularizedGammaP(shape, (ageHours + horizonHours) / scale);
+  const survive = 1 - fNow;
+  return clip(survive > 1e-9 ? (fNext - fNow) / survive : 1, 1e-3, 1 - 1e-3);
+}
+
+type MilestoneResult = {
+  pMilestone: number;
+  wMilestone: number;
+  /** Estimated days until the next +1M crossing (null when not estimable). */
+  etaDays: number | null;
+  /** Next milestone level in millions (e.g. 6 when 5M was last crossed). */
+  nextCountM: number | null;
+};
 
 // Extrapolate the next +1M milestone's ETA from logged crossings; return a
 // proximity probability that rises as the forecast nears (and passes) that ETA.
@@ -310,19 +343,24 @@ function milestonePrior(milestones: Milestone[], now: Date): MilestoneResult {
     .map((m) => ({ ms: Date.parse(m.at), countM: m.countM }))
     .filter((p) => Number.isFinite(p.ms) && Number.isFinite(p.countM) && p.countM > 0)
     .sort((a, b) => a.ms - b.ms);
-  if (points.length < MIN_MILESTONES) return { pMilestone: 0, wMilestone: 0 };
+  if (points.length < MIN_MILESTONES) {
+    return { pMilestone: 0, wMilestone: 0, etaDays: null, nextCountM: null };
+  }
 
   const first = points[0];
   const last = points[points.length - 1];
   const spanDays = (last.ms - first.ms) / 86_400_000;
   const countGain = last.countM - first.countM;
-  if (spanDays <= 0 || countGain <= 0) return { pMilestone: 0, wMilestone: 0 };
+  if (spanDays <= 0 || countGain <= 0) {
+    return { pMilestone: 0, wMilestone: 0, etaDays: null, nextCountM: null };
+  }
 
   const daysPerMilestone = spanDays / countGain;
   const daysSinceLast = (now.getTime() - last.ms) / 86_400_000;
   const progress = clip(daysSinceLast / daysPerMilestone, 0, 5);
   const pMilestone = clip(sigmoid((progress - MILESTONE_CENTER) / MILESTONE_SLOPE), 1e-3, 1 - 1e-3);
-  return { pMilestone, wMilestone: W_MILESTONE_MAX };
+  const etaDays = Math.max(0, Math.round(daysPerMilestone - daysSinceLast));
+  return { pMilestone, wMilestone: W_MILESTONE_MAX, etaDays, nextCountM: last.countM + 1 };
 }
 
 function predictionWindow(chance: number): string {
@@ -344,6 +382,161 @@ function summary(status: Forecast["status"], chance: number, cadence: Cadence | 
   if (chance >= 55) return "Several useful signals exist, but confidence is still moderate." + note;
   if (chance >= 35) return "There are weak signals, but they do not agree strongly yet." + note;
   return "Current signals do not point to an imminent reset." + note;
+}
+
+// ── Forecast Board ────────────────────────────────────────────────────────
+// The headline event read several ways: time windows (24h / 48h / 7-day) plus
+// the standalone drivers (cadence pressure, milestone proximity, live signal
+// heat). Every figure is a real decomposition of the pipeline above.
+
+function statusFor(p: number, dir: BoardDirection): { status: BoardStatus; label: string } {
+  if (p >= 65) return { status: "likely", label: "LIKELY" };
+  if (dir === "rising" && p >= 30 && p < 55) return { status: "shifting", label: "SHIFTING" };
+  if (p >= 45) return { status: "watch", label: "WATCH" };
+  if (p >= 28) return { status: "tossup", label: "TOSS-UP" };
+  return { status: "unlikely", label: "UNLIKELY" };
+}
+
+/**
+ * P(reset within `horizonHours`): reset in the first 24h (the live pipeline
+ * value `pNow`), OR survive 24h and then reset by H under the cadence hazard.
+ * Falls back to an independent-days compound when no cadence is fitted.
+ */
+function windowProbability(
+  pNow: number,
+  prior: PriorResult,
+  horizonHours: number
+): { p: number; estimate: boolean } {
+  if (horizonHours <= 24) return { p: pNow, estimate: false };
+  const beyond = hazardWithin(prior.shape, prior.scale, (prior.ageHours ?? 0) + 24, horizonHours - 24);
+  if (beyond === null || prior.wPrior <= 0) {
+    const p = 1 - (1 - pNow) ** (horizonHours / 24);
+    return { p: clip(p, 0.01, 0.99), estimate: true };
+  }
+  const p = 1 - (1 - pNow) * (1 - beyond);
+  return { p: clip(p, 0.01, 0.99), estimate: false };
+}
+
+type BoardInputs = {
+  chance: number;
+  signalChance: number;
+  prior: PriorResult;
+  milestone: MilestoneResult;
+  topSignal: Signal | null;
+  sourceCount: number;
+};
+
+function computeBoard(inputs: BoardInputs): BoardRow[] {
+  const { chance, signalChance, prior, milestone, topSignal, sourceCount } = inputs;
+  const pNow = clip(chance / 100, 0.01, 0.99);
+  const cadenceActive = prior.wPrior > 0 && prior.cadence !== null;
+  const confPct = Math.round((prior.cadence?.confidence ?? 0) * 100);
+  const topText = topSignal
+    ? `${topSignal.sourceLabel} — ${topSignal.title.replace(/^#\d+\s*/, "").slice(0, 46)}`
+    : "Awaiting fresh signals";
+
+  const rows: BoardRow[] = [];
+
+  // 01 — headline 24h window (the full published pipeline value).
+  {
+    const dir: BoardDirection = "stable";
+    const { status, label } = statusFor(chance, dir);
+    rows.push({
+      id: "01",
+      question: "Will Codex reset within the next 24 hours?",
+      probability: chance,
+      status,
+      statusLabel: label,
+      direction: dir,
+      deadline: "24H WINDOW",
+      confidence: cadenceActive ? `conf ${confPct}%` : "signal-only",
+      lastSignal: `Last signal: ${topText}`,
+      lead: true
+    });
+  }
+
+  // 02 / 03 — longer windows from the age-conditioned cadence hazard.
+  let prevP = chance;
+  for (const [h, id, caption] of [
+    [48, "02", "48H WINDOW"],
+    [168, "03", "7-DAY WINDOW"]
+  ] as const) {
+    const { p, estimate } = windowProbability(pNow, prior, h);
+    const prob = Math.max(prevP, Math.round(p * 100)); // enforce monotonic windows
+    prevP = prob;
+    const dir: BoardDirection = "rising";
+    const { status, label } = statusFor(prob, dir);
+    rows.push({
+      id,
+      question: h === 48 ? "…within the next 48 hours?" : "…within the next 7 days?",
+      probability: prob,
+      status,
+      statusLabel: label,
+      direction: dir,
+      deadline: caption,
+      confidence: estimate ? "estimate" : `conf ${confPct}%`,
+      lastSignal:
+        h === 168 ? "Reset Radar cadence aggregate" : `Last signal: ${topText}`
+    });
+  }
+
+  // 04 — cadence pressure (the clock alone), only when the prior is validated.
+  if (cadenceActive && prior.cadence) {
+    const prob = Math.max(1, Math.min(99, Math.round(100 * prior.pPrior)));
+    const ageDays = prior.ageHours !== null ? Math.round(prior.ageHours / 24) : 0;
+    const medianDays = Math.round(prior.cadence.medianGapHours / 24);
+    const overdue = (prior.ageHours ?? 0) < prior.cadence.medianGapHours;
+    const dir: BoardDirection = overdue ? "rising" : "falling";
+    const { status, label } = statusFor(prob, dir);
+    rows.push({
+      id: String(rows.length + 1).padStart(2, "0"),
+      question: `Overdue against the ~${medianDays}-day cadence?`,
+      probability: prob,
+      status,
+      statusLabel: label,
+      direction: dir,
+      deadline: `${ageDays}D SINCE LAST`,
+      confidence: `conf ${confPct}%`,
+      lastSignal: `Radar history · ${prior.cadence.nResets} fleet-wide resets`
+    });
+  }
+
+  // 05 — milestone proximity, only when crossings give an ETA.
+  if (milestone.wMilestone > 0 && milestone.etaDays !== null) {
+    const prob = Math.max(1, Math.min(99, Math.round(100 * milestone.pMilestone)));
+    const dir: BoardDirection = "rising";
+    const { status, label } = statusFor(prob, dir);
+    rows.push({
+      id: String(rows.length + 1).padStart(2, "0"),
+      question: "Triggered by the next +1M-user milestone?",
+      probability: prob,
+      status,
+      statusLabel: label,
+      direction: dir,
+      deadline: milestone.nextCountM ? `~${milestone.etaDays}D TO ${milestone.nextCountM}M` : `~${milestone.etaDays}D`,
+      confidence: "medium",
+      lastSignal: "Sam Altman pledge · reset every +1M WAU → 10M"
+    });
+  }
+
+  // 06 — live signal heat (always present): how hot are the public signals now.
+  {
+    const dir: BoardDirection = "stable";
+    const { status, label } = statusFor(signalChance, dir);
+    rows.push({
+      id: String(rows.length + 1).padStart(2, "0"),
+      question: "How hot are the public signals right now?",
+      probability: signalChance,
+      status,
+      statusLabel: label,
+      direction: dir,
+      deadline: "LIVE NOW",
+      confidence: `${sourceCount} sources`,
+      lastSignal: topSignal ? `Top: ${topSignal.sourceLabel}` : "No active signals"
+    });
+  }
+
+  return rows;
 }
 
 export type ScoredForecast = {
@@ -392,7 +585,8 @@ export function scoreForecastDetailed(
   const raw = cappedTotal + agree;
   const signalChance = Math.max(1, Math.min(95, Math.round(raw)));
 
-  const { pPrior, wPrior, cadence, ageHours } = periodicPrior(resets, now);
+  const prior = periodicPrior(resets, now);
+  const { pPrior, wPrior, cadence, ageHours } = prior;
   const pSignalClamped = clip(Math.min(raw, 95) / 100, 1e-3, 1 - 1e-3);
 
   let chance = signalChance;
@@ -409,7 +603,8 @@ export function scoreForecastDetailed(
   // Milestone proximity is a ONE-WAY catalyst: blend onto the live signal and take
   // the max, so it lifts the chance as the next +1M milestone nears but never
   // double-counts "still early" with the age prior (which already handles dampening).
-  const { pMilestone, wMilestone } = milestonePrior(milestones, now);
+  const milestone = milestonePrior(milestones, now);
+  const { pMilestone, wMilestone } = milestone;
   if (wMilestone > 0) {
     const lifted = Math.max(
       1,
@@ -472,6 +667,15 @@ export function scoreForecastDetailed(
     forecast.signalChance = signalChance;
   }
   if (cadence) forecast.cadence = cadence;
+
+  forecast.board = computeBoard({
+    chance,
+    signalChance,
+    prior,
+    milestone,
+    topSignal: forecast.topSignals[0] ?? null,
+    sourceCount: new Set(ranked.map((item) => item.signal.source)).size
+  });
 
   return { forecast, features, variants };
 }

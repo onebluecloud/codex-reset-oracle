@@ -26,6 +26,31 @@ const sampleSnapshot: Snapshot = {
         strength: 0.8,
         reason: "Tibo mentioned reset and capacity."
       }
+    ],
+    board: [
+      {
+        id: "01",
+        question: "Will Codex reset within the next 24 hours?",
+        probability: 72,
+        status: "likely",
+        statusLabel: "LIKELY",
+        direction: "stable",
+        deadline: "24H WINDOW",
+        confidence: "conf 45%",
+        lastSignal: "Last signal: X/Twitter — Reset and capacity mention",
+        lead: true
+      },
+      {
+        id: "02",
+        question: "How hot are the public signals right now?",
+        probability: 60,
+        status: "watch",
+        statusLabel: "WATCH",
+        direction: "stable",
+        deadline: "LIVE NOW",
+        confidence: "1 sources",
+        lastSignal: "Top: X/Twitter"
+      }
     ]
   },
   signals: [],
@@ -90,13 +115,14 @@ afterEach(() => {
 });
 
 describe("ForecastDashboard", () => {
-  it("renders the current forecast and top signal reason", () => {
+  it("renders the hero question and the forecast board lead row", () => {
     render(<ForecastDashboard initialSnapshot={sampleSnapshot} />);
 
-    expect(screen.getByText("Codex Reset Chance")).toBeInTheDocument();
-    expect(screen.getByText("72")).toBeInTheDocument();
-    expect(screen.getByText("Possible within 18-36 hours")).toBeInTheDocument();
-    expect(screen.getByText("Tibo mentioned reset and capacity.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /will it\s*reset/i })).toBeInTheDocument();
+    expect(screen.getByText("Will Codex reset within the next 24 hours?")).toBeInTheDocument();
+    expect(screen.getByText("LIKELY")).toBeInTheDocument();
+    // 72 appears in both the hero readout and the board lead row.
+    expect(screen.getAllByText("72").length).toBeGreaterThan(0);
   });
 
   it("renders safe source labels without raw collector messages", () => {

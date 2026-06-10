@@ -334,6 +334,85 @@ describe("scoreForecastDetailed", () => {
   });
 });
 
+describe("forecast board", () => {
+  function radarSignal(strength = 0.25): Signal {
+    return signal({
+      id: "radar",
+      source: "codex-reset-radar",
+      sourceLabel: "Codex Reset Radar",
+      sourceWeight: 1,
+      strength,
+      title: "Codex Reset Radar: medium probability",
+      publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+    });
+  }
+
+  it("always emits a board whose lead row is the published 24h chance", () => {
+    const { forecast } = scoreForecastDetailed([radarSignal()], NOW);
+    expect(forecast.board).toBeDefined();
+    const lead = forecast.board![0];
+    expect(lead.lead).toBe(true);
+    expect(lead.id).toBe("01");
+    expect(lead.probability).toBe(forecast.chance);
+    expect(lead.deadline).toBe("24H WINDOW");
+  });
+
+  it("keeps the time-window rows monotonic (24h ≤ 48h ≤ 7d)", () => {
+    // A clean overdue cadence so the hazard path (not the compound fallback) runs.
+    const lastReset = new Date(NOW.getTime() - 200 * 3_600_000);
+    const resets: ResetRecord[] = Array.from({ length: 6 }, (_, i) => ({
+      kind: "reset",
+      at: new Date(lastReset.getTime() - i * 168 * 3_600_000).toISOString()
+    }));
+    const { forecast } = scoreForecastDetailed([radarSignal()], NOW, resets);
+    const board = forecast.board!;
+    const win24 = board.find((r) => r.deadline === "24H WINDOW")!;
+    const win48 = board.find((r) => r.deadline === "48H WINDOW")!;
+    const win7d = board.find((r) => r.deadline === "7-DAY WINDOW")!;
+    expect(win48.probability).toBeGreaterThanOrEqual(win24.probability);
+    expect(win7d.probability).toBeGreaterThanOrEqual(win48.probability);
+  });
+
+  it("adds a cadence row only when the prior is active, and a signal-heat row always", () => {
+    const noCadence = scoreForecastDetailed([radarSignal()], NOW).forecast.board!;
+    // No resets → no cadence row; 7-day window falls back to an estimate.
+    expect(noCadence.some((r) => r.question.includes("cadence"))).toBe(false);
+    expect(noCadence.find((r) => r.deadline === "7-DAY WINDOW")!.confidence).toBe("estimate");
+    expect(noCadence.some((r) => r.deadline === "LIVE NOW")).toBe(true);
+
+    const lastReset = new Date(NOW.getTime() - 200 * 3_600_000);
+    const resets: ResetRecord[] = Array.from({ length: 6 }, (_, i) => ({
+      kind: "reset",
+      at: new Date(lastReset.getTime() - i * 168 * 3_600_000).toISOString()
+    }));
+    const withCadence = scoreForecastDetailed([radarSignal()], NOW, resets).forecast.board!;
+    expect(withCadence.some((r) => r.question.includes("cadence"))).toBe(true);
+  });
+
+  it("adds a milestone row with an ETA caption when crossings are known", () => {
+    const day = (d: number) => new Date(NOW.getTime() - d * 86_400_000).toISOString();
+    const milestones = [
+      { at: day(38), countM: 3 },
+      { at: day(25), countM: 4 },
+      { at: day(12), countM: 5 }
+    ];
+    const board = scoreForecastDetailed([radarSignal()], NOW, [], milestones).forecast.board!;
+    const ms = board.find((r) => r.question.includes("milestone"));
+    expect(ms).toBeDefined();
+    expect(ms!.deadline).toMatch(/~\d+D TO 6M/);
+  });
+
+  it("gives every row a valid status and probability in range", () => {
+    const { forecast } = scoreForecastDetailed([radarSignal()], NOW);
+    for (const row of forecast.board!) {
+      expect(row.probability).toBeGreaterThanOrEqual(1);
+      expect(row.probability).toBeLessThanOrEqual(100);
+      expect(["likely", "watch", "tossup", "unlikely", "shifting"]).toContain(row.status);
+      expect(row.statusLabel.length).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe("cadence prior (time-since-last-reset)", () => {
   function radarSignals(): Signal[] {
     return [

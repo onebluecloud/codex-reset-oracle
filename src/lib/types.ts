@@ -52,6 +52,13 @@ export type ResetDetail = {
   kind: "incident" | "milestone" | "celebration" | "other";
 };
 
+/** A fleet-wide reset projected onto the forecast axis as an event marker. */
+export type AxisEvent = {
+  at: string;
+  label: string;
+  kind: ResetDetail["kind"];
+};
+
 export type Cadence = {
   medianGapHours: number;
   muHatHours: number;
@@ -68,6 +75,30 @@ export type Milestone = {
   countM: number;
 };
 
+export type BoardStatus = "likely" | "watch" | "tossup" | "unlikely" | "shifting";
+export type BoardDirection = "rising" | "falling" | "stable";
+
+/**
+ * One row of the Forecast Board — the same Codex-reset event read from a
+ * different angle (a time window or a single driver). Every probability is a
+ * real decomposition of the scoring pipeline, never a fabricated extra event.
+ */
+export type BoardRow = {
+  id: string;
+  question: string;
+  probability: number;
+  status: BoardStatus;
+  statusLabel: string;
+  direction: BoardDirection;
+  /** Short window/age caption, e.g. "24H WINDOW" or "5D SINCE LAST". */
+  deadline: string;
+  /** Confidence caption, e.g. "±9%", "conf 45%", "estimate". */
+  confidence: string;
+  lastSignal: string;
+  /** True for the oversized primary (24h) row. */
+  lead?: boolean;
+};
+
 export type Forecast = {
   status: ForecastStatus;
   chance: number;
@@ -79,6 +110,8 @@ export type Forecast = {
   priorChance?: number;
   signalChance?: number;
   cadence?: Cadence;
+  /** The Forecast Board rows — the headline event read several ways. */
+  board?: BoardRow[];
 };
 
 /**

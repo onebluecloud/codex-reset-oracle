@@ -182,6 +182,16 @@ export async function readArchivedResets(): Promise<ResetRecord[]> {
     .map((row) => ({ kind: "reset" as const, at: row.at }));
 }
 
+/** Archived fleet-wide resets with full detail (title/kind) — feeds the axis event markers. */
+export async function readArchivedResetDetails(): Promise<ResetDetail[]> {
+  const client = redis();
+  if (!client) return [];
+  const rows = (await client.lrange<ResetDetail>(RESET_ARCHIVE_KEY, 0, RESET_ARCHIVE_LIMIT - 1)) ?? [];
+  return rows.filter(
+    (row): row is ResetDetail => Boolean(row) && typeof row.at === "string" && Number.isFinite(Date.parse(row.at))
+  );
+}
+
 const PREDLOG_KEY = "oracle:predlog";
 // 720 hourly entries ≈ 30 days. The ring buffer is NOT the training window —
 // resolved rows are archived separately (oracle:resolved-archive) so the
