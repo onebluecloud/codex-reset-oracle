@@ -5,7 +5,9 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
-    setupFiles: ["./src/test/setup.ts"]
+    setupFiles: ["./src/test/setup.ts"],
+    // tests/ holds Playwright specs (run via `playwright test`), not vitest suites.
+    exclude: ["**/node_modules/**", "tests/**"]
   },
   resolve: {
     alias: {

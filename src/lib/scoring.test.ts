@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { ResetRecord } from "./kv";
-import { __test, scoreForecast } from "./scoring";
-import type { Signal } from "./types";
+import { __test, scoreForecast, scoreForecastDetailed } from "./scoring";
+import type { AuxSignal, Signal } from "./types";
 
 const NOW = new Date("2026-06-07T12:00:00.000Z");
 
@@ -259,6 +259,78 @@ describe("scoreForecast", () => {
     expect(Number.isFinite(forecast.chance)).toBe(true);
     expect(forecast.chance).toBeGreaterThanOrEqual(1);
     expect(forecast.chance).toBeLessThanOrEqual(95);
+  });
+});
+
+describe("aux community sources in scoring", () => {
+  function hnSignal(index: number): AuxSignal {
+    return {
+      ...signal({ id: `hn-${index}` }),
+      source: "hn",
+      sourceLabel: "Hacker News",
+      sourceWeight: 0.4,
+      url: `https://news.ycombinator.com/item?id=${index}`,
+      publishedAt: new Date("2026-06-07T11:00:00.000Z").toISOString()
+    };
+  }
+
+  it("caps a flood of HN signals at the low per-source budget", () => {
+    const flood = Array.from({ length: 30 }, (_, index) => hnSignal(index));
+    const forecast = scoreForecast(flood, NOW);
+    // 30 strong HN items capped at 10 points — community noise nudges only.
+    expect(forecast.chance).toBeLessThanOrEqual(10);
+  });
+
+  it("keeps aux sources out of topSignals and the agreement bonus", () => {
+    const forecast = scoreForecast(
+      [hnSignal(1), signal({ id: "main-x", source: "x" })],
+      NOW
+    );
+    // topSignals is typed Signal[] (main sources only) — the aux item must be gone.
+    expect(forecast.topSignals.map((item) => item.id)).toEqual(["main-x"]);
+    // One main + one aux source → no 2-source agreement bonus from aux.
+    const mainOnly = scoreForecast([signal({ id: "main-x", source: "x" })], NOW);
+    expect(forecast.chance - mainOnly.chance).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("scoreForecastDetailed", () => {
+  it("returns null features/variants on no-data", () => {
+    const { forecast, features, variants } = scoreForecastDetailed([], NOW);
+    expect(forecast.status).toBe("no-data");
+    expect(features).toBeNull();
+    expect(variants).toBeNull();
+  });
+
+  it("keeps blended identical to the published chance and calibrated identical without a model", () => {
+    const { forecast, features, variants } = scoreForecastDetailed(
+      [signal({ id: "main-x", source: "x" })],
+      NOW
+    );
+    expect(variants?.blended).toBe(forecast.chance);
+    expect(variants?.calibrated).toBe(forecast.chance); // no model → identity
+    expect(variants?.signalOnly).toBe(forecast.chance); // no prior active here
+    expect(features?.v).toBe(1);
+    expect(features?.srcPts.x).toBeGreaterThan(0);
+    expect(features?.signalChance).toBe(forecast.chance);
+  });
+
+  it("records prior decomposition when the cadence prior is active", () => {
+    const lastReset = new Date(NOW.getTime() - 200 * 3_600_000);
+    const resets: ResetRecord[] = Array.from({ length: 6 }, (_, i) => ({
+      kind: "reset",
+      at: new Date(lastReset.getTime() - i * 168 * 3_600_000).toISOString()
+    }));
+    const { forecast, features, variants } = scoreForecastDetailed(
+      [signal({ id: "main-x", source: "x", strength: 0.3 })],
+      NOW,
+      resets
+    );
+    expect(features?.pPrior).not.toBeNull();
+    expect(features?.wPrior).toBeGreaterThan(0);
+    expect(features?.ageH).toBeCloseTo(200, 0);
+    expect(variants?.priorOnly).not.toBeNull();
+    expect(variants?.blended).toBe(forecast.chance);
   });
 });
 

@@ -1,26 +1,45 @@
 import type { ResetRecord } from "./kv";
-import type { Cadence, Forecast, Milestone, Signal } from "./types";
+import { applyModel } from "./model";
+import type { OracleModel } from "./model";
+import type {
+  AnySource,
+  AuxSignal,
+  Cadence,
+  Forecast,
+  ForecastFeatures,
+  ForecastVariants,
+  Milestone,
+  Signal
+} from "./types";
 
 type ScoredSignal = {
-  signal: Signal;
+  signal: AuxSignal;
   ageHours: number;
   sanitizedScore: number;
 };
 
 const DEFAULT_SOURCE_POINT_CAP = 35;
-const SOURCE_POINT_CAPS: Partial<Record<Signal["source"], number>> = {
+const SOURCE_POINT_CAPS: Partial<Record<AnySource, number>> = {
   github: 8,
-  "codex-reset-radar": 75
+  "codex-reset-radar": 75,
+  // Aux community sources: low caps — noisy venues nudge, never drive.
+  hn: 10,
+  "openai-forum": 12
 };
 const DEFAULT_SOURCE_POINT_SCALE = 35;
-const SOURCE_POINT_SCALES: Partial<Record<Signal["source"], number>> = {
+const SOURCE_POINT_SCALES: Partial<Record<AnySource, number>> = {
   "codex-reset-radar": 100
 };
-const AGREEMENT_ELIGIBLE_SOURCES = new Set<Signal["source"]>([
-  "x",
-  "openai-status",
-  "codex-reset-radar"
-]);
+// Aux sources are deliberately excluded: brigading/cross-posting must not be
+// able to trigger the cross-source agreement bonus.
+const AGREEMENT_ELIGIBLE_SOURCES = new Set<AnySource>(["x", "openai-status", "codex-reset-radar"]);
+
+const MAIN_SOURCES = new Set<AnySource>(["x", "openai-status", "github", "codex-reset-radar"]);
+
+/** Aux signals feed the score but never the UI-facing topSignals list. */
+function isMainSignal(signal: AuxSignal): signal is Signal {
+  return MAIN_SOURCES.has(signal.source);
+}
 
 function sanitizeUnit(value: number): number {
   if (!Number.isFinite(value) || value < 0) return 0;
@@ -28,7 +47,7 @@ function sanitizeUnit(value: number): number {
   return value;
 }
 
-function hoursOld(signal: Signal, now: Date): number {
+function hoursOld(signal: AuxSignal, now: Date): number {
   const age = (now.getTime() - new Date(signal.publishedAt).getTime()) / 3_600_000;
   return Number.isFinite(age) ? Math.max(0, age) : Number.POSITIVE_INFINITY;
 }
@@ -41,7 +60,7 @@ function recencyMultiplier(ageHours: number): number {
   return 0.1;
 }
 
-function scoreSignal(signal: Signal, now: Date): ScoredSignal {
+function scoreSignal(signal: AuxSignal, now: Date): ScoredSignal {
   const ageHours = hoursOld(signal, now);
   const sourceWeight = sanitizeUnit(signal.sourceWeight);
   const strength = sanitizeUnit(signal.strength);
@@ -53,11 +72,11 @@ function scoreSignal(signal: Signal, now: Date): ScoredSignal {
   };
 }
 
-function sourcePointCap(source: Signal["source"]): number {
+function sourcePointCap(source: AnySource): number {
   return SOURCE_POINT_CAPS[source] ?? DEFAULT_SOURCE_POINT_CAP;
 }
 
-function sourcePointScale(source: Signal["source"]): number {
+function sourcePointScale(source: AnySource): number {
   return SOURCE_POINT_SCALES[source] ?? DEFAULT_SOURCE_POINT_SCALE;
 }
 
@@ -65,18 +84,24 @@ function signalPointValue(item: ScoredSignal): number {
   return item.sanitizedScore * sourcePointScale(item.signal.source);
 }
 
-function cappedSignalPoints(items: ScoredSignal[]): number {
-  const pointsBySource = new Map<Signal["source"], number>();
-
+/** Per-source signal points, capped per source. */
+function cappedPointsBySource(items: ScoredSignal[]): Map<AnySource, number> {
+  const pointsBySource = new Map<AnySource, number>();
   for (const item of items) {
     const source = item.signal.source;
     pointsBySource.set(source, (pointsBySource.get(source) ?? 0) + signalPointValue(item));
   }
+  const capped = new Map<AnySource, number>();
+  for (const [source, points] of pointsBySource) {
+    capped.set(source, Math.min(points, sourcePointCap(source)));
+  }
+  return capped;
+}
 
-  return Array.from(pointsBySource.entries()).reduce(
-    (total, [source, points]) => total + Math.min(points, sourcePointCap(source)),
-    0
-  );
+function cappedSignalPoints(items: ScoredSignal[]): number {
+  let total = 0;
+  for (const points of cappedPointsBySource(items).values()) total += points;
+  return total;
 }
 
 function agreementBonus(items: ScoredSignal[]): number {
@@ -201,7 +226,13 @@ function lowerRegularizedGammaP(k: number, x: number): number {
   return 1 - q;
 }
 
-type PriorResult = { pPrior: number; wPrior: number; cadence: Cadence | null };
+type PriorResult = {
+  pPrior: number;
+  wPrior: number;
+  cadence: Cadence | null;
+  /** Hours since the last known fleet-wide reset (null when no resets known). */
+  ageHours: number | null;
+};
 
 function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   const times = resets
@@ -209,15 +240,16 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
     .filter((value) => Number.isFinite(value))
     .sort((a, b) => a - b);
   const n = times.length;
-  if (n < 2) return { pPrior: 0, wPrior: 0, cadence: null };
+  if (n === 0) return { pPrior: 0, wPrior: 0, cadence: null, ageHours: null };
 
   const ageHours = Math.max(0, (now.getTime() - times[n - 1]) / 3_600_000);
+  if (n < 2) return { pPrior: 0, wPrior: 0, cadence: null, ageHours };
 
   const gaps: number[] = [];
   for (let i = 1; i < n; i += 1) gaps.push((times[i] - times[i - 1]) / 3_600_000);
   const cleanGaps = gaps.filter((gap) => gap >= GAP_FLOOR_HOURS);
   const m = cleanGaps.length;
-  if (m < MIN_GAPS_FOR_PRIOR) return { pPrior: 0, wPrior: 0, cadence: null };
+  if (m < MIN_GAPS_FOR_PRIOR) return { pPrior: 0, wPrior: 0, cadence: null, ageHours };
 
   const medianGap = median(cleanGaps);
   const std = sampleStd(cleanGaps);
@@ -236,7 +268,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   // tempered weight; a ragged, event-driven one earns a low weight so its age
   // term only nudges; at/above CUTOFF the cadence is too chaotic to trust at all.
   if (!Number.isFinite(cv) || cv >= REGULARITY_CV_CUTOFF) {
-    return { pPrior: 0, wPrior: 0, cadence };
+    return { pPrior: 0, wPrior: 0, cadence, ageHours };
   }
   const regularityFactor = clip(
     (REGULARITY_CV_CUTOFF - cv) / (REGULARITY_CV_CUTOFF - REGULARITY_CV_GOOD),
@@ -252,7 +284,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   const shape = (muHat * muHat) / (sigHat * sigHat);
   const scale = (sigHat * sigHat) / muHat;
   if (!Number.isFinite(shape) || !Number.isFinite(scale) || shape <= 0 || scale <= 0) {
-    return { pPrior: 0, wPrior: 0, cadence };
+    return { pPrior: 0, wPrior: 0, cadence, ageHours };
   }
 
   // P(reset within next 24h | survived ageHours since the last reset).
@@ -266,7 +298,7 @@ function periodicPrior(resets: ResetRecord[], now: Date): PriorResult {
   cadence.sigHatHours = sigHat;
   cadence.confidence = confidence;
 
-  return { pPrior, wPrior: W_PRIOR_MAX * confidence, cadence };
+  return { pPrior, wPrior: W_PRIOR_MAX * confidence, cadence, ageHours };
 }
 
 type MilestoneResult = { pMilestone: number; wMilestone: number };
@@ -314,21 +346,38 @@ function summary(status: Forecast["status"], chance: number, cadence: Cadence | 
   return "Current signals do not point to an imminent reset." + note;
 }
 
-export function scoreForecast(
-  signals: Signal[],
+export type ScoredForecast = {
+  forecast: Forecast;
+  features: ForecastFeatures | null;
+  variants: ForecastVariants | null;
+};
+
+/**
+ * Full scoring pipeline with decomposed outputs. The published forecast.chance
+ * stays the hand-tuned blend; the model only produces the shadow `calibrated`
+ * variant. `features` and `variants.blended` are computed BEFORE the model is
+ * applied — the trainer must never see post-calibration values (no self-feeding).
+ */
+export function scoreForecastDetailed(
+  signals: AuxSignal[],
   now: Date = new Date(),
   resets: ResetRecord[] = [],
-  milestones: Milestone[] = []
-): Forecast {
+  milestones: Milestone[] = [],
+  model: OracleModel | null = null
+): ScoredForecast {
   if (signals.length === 0) {
     // No live signals → honest no-data. A prior must never fabricate a chance.
     return {
-      status: "no-data",
-      chance: 0,
-      window: "No fresh data",
-      summary: summary("no-data", 0, null),
-      topSignals: [],
-      generatedAt: now.toISOString()
+      forecast: {
+        status: "no-data",
+        chance: 0,
+        window: "No fresh data",
+        summary: summary("no-data", 0, null),
+        topSignals: [],
+        generatedAt: now.toISOString()
+      },
+      features: null,
+      variants: null
     };
   }
 
@@ -336,10 +385,14 @@ export function scoreForecast(
     .map((signal) => scoreSignal(signal, now))
     .sort((a, b) => signalPointValue(b) - signalPointValue(a));
 
-  const raw = cappedSignalPoints(ranked) + agreementBonus(ranked);
+  const pointsBySource = cappedPointsBySource(ranked);
+  let cappedTotal = 0;
+  for (const points of pointsBySource.values()) cappedTotal += points;
+  const agree = agreementBonus(ranked);
+  const raw = cappedTotal + agree;
   const signalChance = Math.max(1, Math.min(95, Math.round(raw)));
 
-  const { pPrior, wPrior, cadence } = periodicPrior(resets, now);
+  const { pPrior, wPrior, cadence, ageHours } = periodicPrior(resets, now);
   const pSignalClamped = clip(Math.min(raw, 95) / 100, 1e-3, 1 - 1e-3);
 
   let chance = signalChance;
@@ -368,12 +421,49 @@ export function scoreForecast(
     }
   }
 
+  // ── Decomposed features (pre-calibration, persisted for future training) ──
+  const srcPts: Partial<Record<string, number>> = {};
+  for (const [source, points] of pointsBySource) {
+    srcPts[source] = Math.round(points * 100) / 100;
+  }
+  const radarStrengths = ranked
+    .filter((item) => item.signal.source === "codex-reset-radar")
+    .map((item) => sanitizeUnit(item.signal.strength));
+  const nonRadarScores = ranked
+    .filter((item) => item.signal.source !== "codex-reset-radar")
+    .map((item) => item.sanitizedScore);
+
+  const features: ForecastFeatures = {
+    v: 1,
+    srcPts,
+    agree,
+    kwTop: nonRadarScores.length > 0 ? Math.round(Math.max(...nonRadarScores) * 1000) / 1000 : 0,
+    radarP: radarStrengths.length > 0 ? Math.round(Math.max(...radarStrengths) * 1000) / 1000 : null,
+    pPrior: wPrior > 0 ? Math.round(pPrior * 1000) / 1000 : null,
+    wPrior: Math.round(wPrior * 1000) / 1000,
+    pMilestone: wMilestone > 0 ? Math.round(pMilestone * 1000) / 1000 : null,
+    wMilestone: Math.round(wMilestone * 1000) / 1000,
+    ageH: ageHours !== null ? Math.round(ageHours * 10) / 10 : null,
+    nResets: cadence?.nResets ?? 0,
+    cadenceConf: Math.round((cadence?.confidence ?? 0) * 1000) / 1000,
+    signalChance
+  };
+
+  // ── Shadow variants — `calibrated` never touches the published chance ──
+  const variants: ForecastVariants = {
+    signalOnly: signalChance,
+    priorOnly: wPrior > 0 ? Math.max(1, Math.min(99, Math.round(100 * pPrior))) : null,
+    blended: chance,
+    calibrated: applyModel(model, features, chance)
+  };
+
   const forecast: Forecast = {
     status: "ok",
     chance,
     window: predictionWindow(chance),
     summary: summary("ok", chance, cadence),
-    topSignals: ranked.slice(0, 5).map((item) => item.signal),
+    // Aux (scoring-only) sources never surface in the UI-facing list.
+    topSignals: ranked.map((item) => item.signal).filter(isMainSignal).slice(0, 5),
     generatedAt: now.toISOString()
   };
 
@@ -383,7 +473,16 @@ export function scoreForecast(
   }
   if (cadence) forecast.cadence = cadence;
 
-  return forecast;
+  return { forecast, features, variants };
+}
+
+export function scoreForecast(
+  signals: AuxSignal[],
+  now: Date = new Date(),
+  resets: ResetRecord[] = [],
+  milestones: Milestone[] = []
+): Forecast {
+  return scoreForecastDetailed(signals, now, resets, milestones).forecast;
 }
 
 // Exported for unit-testing the numeric core.

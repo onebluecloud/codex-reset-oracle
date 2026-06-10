@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { bucketCalibration, resolvePredlogEntries, type PredlogEntry } from "./kv";
+import {
+  bucketCalibration,
+  resolvePredlogEntries,
+  selectNewArchiveEntries,
+  variantMetrics,
+  type PredlogEntry
+} from "./kv";
+import type { ForecastFeatures, ForecastVariants, ResetDetail } from "./types";
 
 function entry(overrides: Partial<PredlogEntry>): PredlogEntry {
   return {
@@ -52,6 +59,32 @@ describe("resolvePredlogEntries", () => {
     const { updated } = resolvePredlogEntries(rows, ["2026-06-07T00:00:00.000Z"], NOW);
     expect(updated[0].actualReset).toBe(false);
   });
+
+  it("carries features and variants through resolution untouched", () => {
+    const features: ForecastFeatures = {
+      v: 1,
+      srcPts: { github: 8 },
+      agree: 0,
+      kwTop: 0.45,
+      radarP: 0.35,
+      pPrior: 0.1,
+      wPrior: 0.13,
+      pMilestone: null,
+      wMilestone: 0,
+      ageH: 120.5,
+      nResets: 5,
+      cadenceConf: 0.45,
+      signalChance: 14
+    };
+    const variants: ForecastVariants = { signalOnly: 14, priorOnly: 10, blended: 11, calibrated: 11 };
+    const rows = [entry({ at: "2026-06-05T00:00:00.000Z", features, variants })];
+
+    const { updated } = resolvePredlogEntries(rows, ["2026-06-05T12:00:00.000Z"], NOW);
+
+    expect(updated[0].resolved).toBe(true);
+    expect(updated[0].features).toEqual(features);
+    expect(updated[0].variants).toEqual(variants);
+  });
 });
 
 describe("bucketCalibration", () => {
@@ -81,5 +114,79 @@ describe("bucketCalibration", () => {
     const { buckets, resolved } = bucketCalibration([entry({ resolved: false })]);
     expect(resolved).toBe(0);
     expect(buckets.every((bucket) => bucket.n === 0 && bucket.rate === null)).toBe(true);
+  });
+});
+
+describe("variantMetrics", () => {
+  const variants = (overrides: Partial<ForecastVariants>): ForecastVariants => ({
+    signalOnly: 20,
+    priorOnly: 10,
+    blended: 15,
+    calibrated: 15,
+    ...overrides
+  });
+
+  it("computes per-variant Brier/log-loss and a paired count", () => {
+    const rows = [
+      entry({ resolved: true, actualReset: false, variants: variants({ blended: 10 }) }),
+      entry({ resolved: true, actualReset: true, variants: variants({ blended: 80, priorOnly: null }) }),
+      entry({ resolved: true, actualReset: false }), // legacy row without variants → excluded
+      entry({ resolved: false, variants: variants({}) }) // unresolved → excluded
+    ];
+
+    const metrics = variantMetrics(rows);
+
+    expect(metrics.blended.n).toBe(2);
+    // Brier = ((0.10-0)^2 + (0.80-1)^2) / 2 = (0.01 + 0.04) / 2.
+    expect(metrics.blended.brier).toBeCloseTo(0.025, 6);
+    expect(metrics.priorOnly.n).toBe(1); // null in the second row → skipped there
+    // Only the first row has all four variants present.
+    expect(metrics.pairedN).toBe(1);
+  });
+
+  it("returns null metrics with no resolved variant rows", () => {
+    const metrics = variantMetrics([entry({ resolved: true, actualReset: false })]);
+    expect(metrics.blended.n).toBe(0);
+    expect(metrics.blended.brier).toBeNull();
+    expect(metrics.pairedN).toBe(0);
+  });
+});
+
+describe("selectNewArchiveEntries", () => {
+  const detail = (at: string, overrides: Partial<ResetDetail> = {}): ResetDetail => ({
+    at,
+    title: "重置",
+    scope: "所有付费计划",
+    kind: "other",
+    ...overrides
+  });
+
+  it("keeps only details not within 6h of an archived entry, sorted ascending", () => {
+    const existing = [detail("2026-06-04T00:25:00.000Z")];
+    const incoming = [
+      detail("2026-06-04T03:00:00.000Z"), // within 6h of existing → dup
+      detail("2026-05-31T05:59:00.000Z"), // new
+      detail("2026-04-17T00:58:00.000Z") // new (and should sort first)
+    ];
+
+    const fresh = selectNewArchiveEntries(existing, incoming);
+
+    expect(fresh.map((entry) => entry.at)).toEqual([
+      "2026-04-17T00:58:00.000Z",
+      "2026-05-31T05:59:00.000Z"
+    ]);
+  });
+
+  it("dedupes within the incoming batch itself and drops bad timestamps", () => {
+    const incoming = [
+      detail("2026-06-04T00:25:00.000Z"),
+      detail("2026-06-04T02:00:00.000Z"), // within 6h of the previous incoming
+      detail("not-a-date")
+    ];
+
+    const fresh = selectNewArchiveEntries([], incoming);
+
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0].at).toBe("2026-06-04T00:25:00.000Z");
   });
 });

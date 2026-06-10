@@ -1,9 +1,21 @@
 import type { ResetRecord } from "../kv";
-import type { Milestone } from "../types";
+import type { Milestone, ResetDetail } from "../types";
 
 const RESET_RADAR_CURRENT_URL = "https://codex-reset-radar.pages.dev/current.json";
 
-export type RadarHistory = { resets: ResetRecord[]; milestones: Milestone[] };
+export type RadarHistory = {
+  resets: ResetRecord[];
+  milestones: Milestone[];
+  details: ResetDetail[];
+  /**
+   * Whether the radar fetch+parse genuinely succeeded. A failed fetch returns
+   * empty arrays, which is indistinguishable from "no resets" — consumers that
+   * use this data as ground truth (prediction resolution) MUST skip their pass
+   * when ok is false, or every due prediction gets mislabeled "no reset" and
+   * poisons the training archive permanently.
+   */
+  ok: boolean;
+};
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -19,16 +31,39 @@ export function isFleetWideScope(scope: unknown): boolean {
   return typeof scope === "string" && scope.includes("所有");
 }
 
-function extractRecentWindows(payload: unknown): unknown[] {
+/**
+ * recent_windows entries, or null when the field is missing/not an array — a
+ * silent upstream schema change must read as "failed", never as "no resets".
+ */
+function extractRecentWindows(payload: unknown): unknown[] | null {
   const record = asRecord(payload);
-  if (!record) return [];
-  return Array.isArray(record.recent_windows) ? record.recent_windows : [];
+  if (!record) return null;
+  return Array.isArray(record.recent_windows) ? record.recent_windows : null;
 }
 
 /** Parse fleet-wide official reset timestamps from radar recent_windows. */
 export function parseResetHistory(payload: unknown): ResetRecord[] {
-  const resets: ResetRecord[] = [];
-  for (const entry of extractRecentWindows(payload)) {
+  return parseResetDetails(payload).map((detail) => ({ kind: "reset", at: detail.at }));
+}
+
+/**
+ * Classify what drove a reset from its announcement text. The gap history mixes
+ * incident-compensation resets with milestone/celebration ones; the archive
+ * keeps the label so the cadence prior can be split per driver once enough
+ * samples accrue.
+ */
+export function classifyResetDriver(text: string): ResetDetail["kind"] {
+  const lower = text.toLowerCase();
+  if (/事故|补偿|降级|故障|宕机|incident|outage|degrad|compensat/.test(lower)) return "incident";
+  if (/万\s*(?:活跃|周活)?用户|里程碑|milestone|million|\bwau\b/.test(lower)) return "milestone";
+  if (/庆祝|感谢|celebrat|thank|anniversar/.test(lower)) return "celebration";
+  return "other";
+}
+
+/** Parse fleet-wide official resets with title + driver classification. */
+export function parseResetDetails(payload: unknown): ResetDetail[] {
+  const details: ResetDetail[] = [];
+  for (const entry of extractRecentWindows(payload) ?? []) {
     const record = asRecord(entry);
     if (!record) continue;
     if (!isFleetWideScope(record.scope)) continue;
@@ -36,9 +71,16 @@ export function parseResetHistory(payload: unknown): ResetRecord[] {
     if (!openedAt) continue;
     const ms = Date.parse(openedAt);
     if (!Number.isFinite(ms)) continue;
-    resets.push({ kind: "reset", at: new Date(ms).toISOString() });
+    const title = typeof record.title === "string" ? record.title : "";
+    const summary = typeof record.summary === "string" ? record.summary : "";
+    details.push({
+      at: new Date(ms).toISOString(),
+      title,
+      scope: typeof record.scope === "string" ? record.scope : "",
+      kind: classifyResetDriver(`${title} ${summary}`)
+    });
   }
-  return resets;
+  return details;
 }
 
 /**
@@ -50,7 +92,7 @@ export function parseResetHistory(payload: unknown): ResetRecord[] {
  */
 export function parseMilestones(payload: unknown): Milestone[] {
   const byLevel = new Map<number, Milestone>();
-  for (const entry of extractRecentWindows(payload)) {
+  for (const entry of extractRecentWindows(payload) ?? []) {
     const record = asRecord(entry);
     if (!record) continue;
     const title = typeof record.title === "string" ? record.title : "";
@@ -75,15 +117,26 @@ export function parseMilestones(payload: unknown): Milestone[] {
  * Both feed scoring's time-based priors, so no manual mark-reset is required.
  * Returns empty arrays on any failure — the priors simply stay inactive.
  */
+const FAILED_HISTORY: RadarHistory = { resets: [], milestones: [], details: [], ok: false };
+
 export async function collectResetHistory(): Promise<RadarHistory> {
   try {
     const response = await fetch(RESET_RADAR_CURRENT_URL, {
       headers: { accept: "application/json" }
     });
-    if (!response.ok) return { resets: [], milestones: [] };
+    if (!response.ok) return FAILED_HISTORY;
     const payload: unknown = await response.json();
-    return { resets: parseResetHistory(payload), milestones: parseMilestones(payload) };
+    // A missing/reshaped recent_windows is an upstream schema change, not an
+    // empty history — treat it as a failure so resolution skips this round.
+    if (extractRecentWindows(payload) === null) return FAILED_HISTORY;
+    const details = parseResetDetails(payload);
+    return {
+      resets: details.map((detail) => ({ kind: "reset", at: detail.at })),
+      milestones: parseMilestones(payload),
+      details,
+      ok: true
+    };
   } catch {
-    return { resets: [], milestones: [] };
+    return FAILED_HISTORY;
   }
 }

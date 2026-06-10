@@ -5,6 +5,8 @@ import { githubIssueFixture } from "@/test/fixtures/github";
 import { statusIncidentFixture } from "@/test/fixtures/status";
 import { collectApifySignals } from "./apify";
 import { collectGithubSignals } from "./github";
+import { collectHnSignals } from "./hn";
+import { collectForumSignals } from "./openai-forum";
 import { collectOpenAIStatusSignals } from "./openai-status";
 import { collectResetRadarSignals } from "./reset-radar";
 
@@ -231,5 +233,93 @@ describe("collectResetRadarSignals", () => {
     expect(result.status.ok).toBe(true);
     expect(result.signals[0]?.strength).toBeCloseTo(0.25);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("collectHnSignals", () => {
+  const NOW = new Date("2026-06-10T00:00:00.000Z");
+  const hnHit = {
+    objectID: "44001234",
+    title: "Codex weekly quota reset happened again",
+    url: "https://example.com/codex-post",
+    author: "pg2",
+    created_at: "2026-06-09T12:00:00.000Z"
+  };
+
+  it("fetches recent Algolia hits and normalizes aux signals", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ hits: [hnHit] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await collectHnSignals(NOW);
+
+    expect(result.status).toMatchObject({ source: "hn", ok: true });
+    expect(result.signals[0]?.source).toBe("hn");
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(url).toContain("hn.algolia.com/api/v1/search_by_date");
+    expect(url).toContain("query=codex");
+    // 72h freshness cutoff derived from `now`.
+    expect(url).toContain(`created_at_i>${Math.floor(NOW.getTime() / 1000) - 72 * 3600}`);
+  });
+
+  it("fails softly on HTTP errors and bad shapes", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({}, { status: 500 })));
+    expect((await collectHnSignals(NOW)).status.ok).toBe(false);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({ nope: true })));
+    expect((await collectHnSignals(NOW)).status.ok).toBe(false);
+  });
+});
+
+describe("collectForumSignals", () => {
+  const forumPayload = {
+    topics: [
+      {
+        id: 987654,
+        title: "Questions about an unexpected Codex usage reset",
+        slug: "questions-about-an-unexpected-codex-usage-reset",
+        created_at: "2026-06-04T03:00:00.000Z"
+      }
+    ],
+    posts: [{ id: 1, topic_id: 987654, blurb: "my codex quota reset early", created_at: "2026-06-04T03:00:00.000Z" }]
+  };
+
+  it("queries the Discourse search JSON and normalizes topics with blurbs", async () => {
+    // Fresh Response per call — a Response body can only be consumed once.
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(forumPayload)));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await collectForumSignals();
+
+    expect(result.status).toMatchObject({ source: "openai-forum", ok: true });
+    expect(result.signals).toHaveLength(1); // deduped across the two queries
+    expect(result.signals[0]).toMatchObject({
+      source: "openai-forum",
+      url: "https://community.openai.com/t/questions-about-an-unexpected-codex-usage-reset/987654"
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [firstUrl] = fetchMock.mock.calls[0] as [string];
+    expect(firstUrl).toContain("community.openai.com/search.json?q=");
+  });
+
+  it("reports failure only when every query is unreachable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(() => Promise.resolve(jsonResponse({}, { status: 403 })))
+    );
+    const blocked = await collectForumSignals();
+    expect(blocked.status.ok).toBe(false);
+    expect(blocked.signals).toEqual([]);
+
+    // One query blocked, one fine → still ok.
+    const mixed = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({}, { status: 403 }))
+      .mockResolvedValueOnce(jsonResponse(forumPayload));
+    vi.stubGlobal("fetch", mixed);
+    const partial = await collectForumSignals();
+    expect(partial.status.ok).toBe(true);
+    expect(partial.signals).toHaveLength(1);
   });
 });

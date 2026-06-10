@@ -1,5 +1,5 @@
 import { KEYWORD_WEIGHTS, WATCHED_ACCOUNTS } from "./defaults";
-import type { Signal } from "./types";
+import type { AuxSignal, Signal } from "./types";
 
 type LooseRecord = Record<string, unknown>;
 
@@ -123,6 +123,78 @@ export function normalizeStatusIncident(raw: unknown): Signal | null {
     matchedKeywords,
     strength: strengthFor(matchedKeywords),
     reason: `OpenAI Status incident mentioned Codex keywords: ${keywordSummary(matchedKeywords)}.`
+  };
+}
+
+/**
+ * Normalize a Hacker News Algolia hit (story or comment) into an aux signal.
+ * Gate mirrors the GitHub one: must mention "codex" plus at least one more
+ * watched keyword — HN is a noisy second-order venue, so it nudges only.
+ */
+export function normalizeHnHit(raw: unknown): AuxSignal | null {
+  const hit = asRecord(raw);
+  if (!hit) return null;
+
+  const text = compactText(hit.title, hit.story_title, hit.story_text, hit.comment_text);
+  const matchedKeywords = matchKeywords(text);
+
+  if (!matchedKeywords.includes("codex") || matchedKeywords.length < 2) return null;
+
+  const objectId = idValue(hit.objectID);
+  const title = firstString(hit.title, hit.story_title) || "Hacker News item";
+
+  return {
+    id: stableId("hn", hit.objectID, hit.url),
+    source: "hn",
+    sourceLabel: "Hacker News",
+    sourceWeight: 0.4,
+    author: stringValue(hit.author),
+    title,
+    text,
+    url:
+      firstString(hit.url, hit.story_url) ||
+      (objectId ? `https://news.ycombinator.com/item?id=${objectId}` : "https://news.ycombinator.com"),
+    publishedAt: publishedAt(hit.created_at),
+    matchedKeywords,
+    strength: strengthFor(matchedKeywords),
+    reason: `Hacker News discussion mentioned Codex keywords: ${keywordSummary(matchedKeywords)}.`
+  };
+}
+
+/**
+ * Normalize an OpenAI developer-forum (Discourse) topic into an aux signal.
+ * Users report unexpected resets / new quota periods there directly, making it
+ * the highest-quality community source. `extraText` carries matching post
+ * blurbs from the same search response for extra keyword surface.
+ */
+export function normalizeForumTopic(raw: unknown, extraText: string = ""): AuxSignal | null {
+  const topic = asRecord(raw);
+  if (!topic) return null;
+
+  const title = firstString(topic.title, topic.fancy_title);
+  const text = compactText(title, extraText);
+  const matchedKeywords = matchKeywords(text);
+
+  if (!matchedKeywords.includes("codex") || matchedKeywords.length < 2) return null;
+
+  const id = idValue(topic.id);
+  if (!id) return null;
+  const slug = stringValue(topic.slug);
+
+  return {
+    id: stableId("openai-forum", topic.id),
+    source: "openai-forum",
+    sourceLabel: "OpenAI Forum",
+    sourceWeight: 0.55,
+    title: title || "OpenAI forum topic",
+    text,
+    url: slug
+      ? `https://community.openai.com/t/${slug}/${id}`
+      : `https://community.openai.com/t/${id}`,
+    publishedAt: publishedAt(topic.created_at, topic.bumped_at),
+    matchedKeywords,
+    strength: strengthFor(matchedKeywords),
+    reason: `OpenAI forum topic mentioned Codex keywords: ${keywordSummary(matchedKeywords)}.`
   };
 }
 

@@ -13,6 +13,6 @@ export async function GET(): Promise<NextResponse> {
   try {
     return NextResponse.json(await readCalibration());
   } catch {
-    return NextResponse.json({ buckets: [], resolved: 0 }, { status: 200 });
+    return NextResponse.json({ buckets: [], resolved: 0, variants: null }, { status: 200 });
   }
 }
