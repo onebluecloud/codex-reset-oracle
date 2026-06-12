@@ -20,10 +20,10 @@ type ForecastDashboardProps = {
 };
 
 const STATUS_LABELS: Record<ForecastStatus, string> = {
-  ok: "Live event forecast",
-  partial: "Partial data",
-  stale: "Stale data",
-  "no-data": "No data yet"
+  ok: "Live reset forecast · Unofficial",
+  partial: "Partial data · Unofficial",
+  stale: "Stale data · Unofficial",
+  "no-data": "No data yet · Unofficial"
 };
 
 const SOURCE_LABELS: Record<SignalSource, string> = {
@@ -54,97 +54,335 @@ function collectorLabel(collector: CollectorStatus): string {
   return SOURCE_LABELS[collector.source];
 }
 
-// ── Axis data prep ──────────────────────────────────────────────────────────
-// Real predlog points become the curve; archived resets become event markers.
-// All projected onto a [tMin, now] domain — honest about however much history
-// actually exists (short at first, lengthening as the log accrues).
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
-type AxisPoint = { tf: number; v: number };
-type AxisMarker = { tf: number; v: number; label: string };
-type AxisTick = { tf: number; text: string };
-type AxisData = {
-  curve: AxisPoint[];
-  markers: AxisMarker[];
-  ticks: AxisTick[];
-  spanDays: number;
+/** Lunar phase name from the illuminated fraction (waxing — fills toward reset). */
+function phaseName(illum: number): string {
+  if (illum < 0.06) return "New moon";
+  if (illum < 0.45) return "Waxing crescent";
+  if (illum < 0.56) return "First quarter";
+  if (illum < 0.94) return "Waxing gibbous";
+  return "Full moon";
+}
+
+// ── Moon timeline data ──────────────────────────────────────────────────────
+// The reset cycle drawn as moon phases: real fleet-wide resets are full moons,
+// the disc fills (illum) toward the next predicted full moon (= next reset).
+type MoonData = {
+  /** Sample the cycle illumination (0..1) at a time fraction across the band. */
+  illumAt: (tf: number) => number;
+  /** Reset time fractions (full moons) inside the band. */
+  resetTfs: number[];
+  /** "Now" position on the band. */
+  nowTf: number;
+  /** Predicted next reset (full moon) position. */
+  nextTf: number;
+  /** Days until the predicted next reset (null when unknown). */
+  nextDays: number | null;
+  /** Most-recent reset timestamp (ms) or null. */
+  lastResetMs: number | null;
+  /** Short date label for each real reset (aligned with resetTfs). */
+  resetDates: string[];
+  /** Short date label for the predicted next reset. */
+  nextDate: string;
 };
 
-function clamp01(value: number): number {
-  return Math.min(1, Math.max(0, value));
+function buildMoonData(
+  events: AxisEvent[],
+  cadenceHours: number | null,
+  nowMs: number
+): MoonData {
+  const resets = (events ?? [])
+    .map((e) => Date.parse(e.at))
+    .filter((ms) => Number.isFinite(ms))
+    .sort((a, b) => a - b);
+  const cadenceMs = (cadenceHours ?? 13 * 24) * 3_600_000;
+  const lastResetMs = resets.length ? resets[resets.length - 1] : null;
+
+  // Predicted next reset = last reset + cadence (at least a little ahead of now).
+  const predictedNext = lastResetMs ? Math.max(lastResetMs + cadenceMs, nowMs + 3_600_000) : nowMs + cadenceMs;
+  const nextDays = Math.max(0, Math.round((predictedNext - nowMs) / 86_400_000));
+
+  // Band domain: a couple of cycles of history through the predicted next reset.
+  const tMin = resets.length ? Math.min(resets[0], nowMs - cadenceMs) : nowMs - cadenceMs * 2;
+  const tMax = predictedNext;
+  const span = Math.max(1, tMax - tMin);
+  const toTf = (ms: number) => clamp01((ms - tMin) / span);
+
+  // anchor full moons = real resets + the predicted next one
+  const fullMoons = [...resets, predictedNext].sort((a, b) => a - b);
+
+  // Illumination at time t: progress from the previous full moon to the next.
+  const illumAtMs = (ms: number): number => {
+    let prev = -Infinity;
+    let next = Infinity;
+    for (const fm of fullMoons) {
+      if (fm <= ms && fm > prev) prev = fm;
+      if (fm >= ms && fm < next) next = fm;
+    }
+    if (prev === -Infinity) return clamp01((ms - tMin) / cadenceMs) * 0.5; // before any reset
+    if (next === Infinity) return clamp01((ms - prev) / cadenceMs);
+    if (next - prev < 1) return 1;
+    return clamp01((ms - prev) / (next - prev));
+  };
+
+  return {
+    illumAt: (tf: number) => illumAtMs(tMin + tf * span),
+    resetTfs: resets.map(toTf),
+    nowTf: toTf(nowMs),
+    nextTf: toTf(predictedNext),
+    nextDays,
+    lastResetMs,
+    resetDates: resets.map(formatShortDate),
+    nextDate: formatShortDate(predictedNext)
+  };
 }
 
-/** Interpolate the curve value (0..1) at a time fraction. */
-function valueAt(curve: AxisPoint[], tf: number): number {
-  if (curve.length === 0) return 0;
-  if (tf <= curve[0].tf) return curve[0].v;
-  if (tf >= curve[curve.length - 1].tf) return curve[curve.length - 1].v;
-  for (let i = 1; i < curve.length; i += 1) {
-    if (tf <= curve[i].tf) {
-      const a = curve[i - 1];
-      const b = curve[i];
-      const f = (tf - a.tf) / Math.max(1e-6, b.tf - a.tf);
-      return a.v + (b.v - a.v) * f;
+// ── Reset-rhythm: a moon-orbit timeline on its own second-screen canvas ────────
+// A node is a real, textured moon at phase f, optionally with a soft spread glow.
+function orbitMoon(
+  g: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  ready: boolean,
+  cx: number,
+  cy: number,
+  R: number,
+  f: number,
+  opt: { ring?: boolean; dashed?: boolean; glow?: boolean; dim?: number } = {}
+) {
+  const { ring = false, dashed = false, glow = false, dim = 1 } = opt;
+  if (glow) {
+    g.save();
+    const gl = g.createRadialGradient(cx, cy, R * 0.82, cx, cy, R * 2.2);
+    const c = dashed ? "150,168,255" : "192,204,255";
+    gl.addColorStop(0, `rgba(${c},0.3)`);
+    gl.addColorStop(0.45, `rgba(${c},0.11)`);
+    gl.addColorStop(1, `rgba(${c},0)`);
+    g.fillStyle = gl;
+    g.beginPath();
+    g.arc(cx, cy, R * 2.2, 0, 6.2832);
+    g.fill();
+    g.restore();
+  }
+  g.save();
+  g.globalAlpha = dim;
+  g.beginPath();
+  g.arc(cx, cy, R, 0, 6.2832);
+  g.clip();
+  if (ready) {
+    const s = 2 * R * 1.08;
+    g.filter = "brightness(1.5) contrast(1.05)";
+    g.drawImage(img, cx - s / 2, cy - s / 2, s, s);
+    g.filter = "none";
+  } else {
+    g.fillStyle = "#c7ccd9";
+    g.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+  }
+  // night side
+  g.save();
+  g.filter = `blur(${Math.max(1, R * 0.04)}px)`;
+  g.fillStyle = "rgba(9,12,26,0.82)";
+  if (f <= 0.5) {
+    g.beginPath();
+    g.rect(cx - R - 2, cy - R - 2, R + 2, 2 * R + 4);
+    g.ellipse(cx, cy, R * (1 - 2 * f), R, 0, 0, 6.2832);
+    g.fill();
+  } else {
+    g.save();
+    g.beginPath();
+    g.rect(cx - R - 2, cy - R - 2, R + 2, 2 * R + 4);
+    g.clip();
+    g.beginPath();
+    g.rect(cx - 2 * R, cy - 2 * R, 4 * R, 4 * R);
+    g.ellipse(cx, cy, R * (2 * f - 1), R, 0, 0, 6.2832);
+    g.clip("evenodd");
+    g.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+    g.restore();
+  }
+  g.filter = "none";
+  g.restore();
+  g.restore();
+  // ring
+  g.save();
+  g.globalAlpha = dim;
+  if (dashed) {
+    g.setLineDash([5, 5]);
+    g.strokeStyle = "rgba(162,178,255,0.9)";
+    g.lineWidth = 2;
+  } else if (ring) {
+    g.strokeStyle = "rgba(216,224,255,0.85)";
+    g.lineWidth = 2;
+  } else {
+    g.strokeStyle = "rgba(150,160,220,0.2)";
+    g.lineWidth = 1;
+  }
+  g.beginPath();
+  g.arc(cx, cy, R, 0, 6.2832);
+  g.stroke();
+  g.setLineDash([]);
+  g.restore();
+}
+
+function drawResetTimeline(
+  g: CanvasRenderingContext2D,
+  W: number,
+  H: number,
+  data: MoonData,
+  img: HTMLImageElement,
+  ready: boolean
+) {
+  const pad = Math.max(56, W * 0.05);
+  const left = pad;
+  const right = W - pad;
+  const width = right - left;
+  const cy = H * 0.62;
+  const amp = H * 0.2;
+  const X = (tf: number) => left + tf * width;
+  const Y = (tf: number) => cy - amp * Math.sin(tf * Math.PI);
+  const nowX = X(data.nowTf);
+  const estX = X(data.nextTf);
+
+  // legend
+  g.textAlign = "left";
+  g.textBaseline = "middle";
+  const ly = Math.max(22, H * 0.08);
+  let lx = left;
+  orbitMoon(g, img, ready, lx + 8, ly, 8, 1, { ring: true });
+  g.font = "500 12px 'JetBrains Mono', monospace";
+  g.fillStyle = "rgba(210,218,255,0.95)";
+  g.fillText("Past reset", lx + 22, ly + 1);
+  lx += 130;
+  g.strokeStyle = "rgba(206,214,255,0.85)";
+  g.lineWidth = 2;
+  g.beginPath();
+  g.moveTo(lx + 6, ly - 8);
+  g.lineTo(lx + 6, ly + 8);
+  g.stroke();
+  g.fillStyle = "rgba(220,226,255,0.95)";
+  g.fillText("Now", lx + 18, ly + 1);
+  lx += 78;
+  orbitMoon(g, img, ready, lx + 8, ly, 8, 1, { dashed: true });
+  g.fillStyle = "rgba(160,176,255,0.95)";
+  g.fillText("Predicted next", lx + 22, ly + 1);
+  g.textBaseline = "alphabetic";
+
+  // the orbit curve: solid up to now, dashed after, highlighted now→est
+  const STEP = 0.004;
+  g.lineWidth = 2;
+  g.strokeStyle = "rgba(190,200,255,0.22)";
+  g.beginPath();
+  for (let tf = 0; tf <= data.nowTf + 1e-6; tf += STEP) {
+    const x = X(tf);
+    const y = Y(tf);
+    if (tf === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  }
+  g.stroke();
+  g.setLineDash([4, 7]);
+  g.strokeStyle = "rgba(150,160,220,0.18)";
+  g.beginPath();
+  let started = false;
+  for (let tf = data.nowTf; tf <= 1 + 1e-6; tf += STEP) {
+    const x = X(tf);
+    const y = Y(tf);
+    if (!started) {
+      g.moveTo(x, y);
+      started = true;
+    } else g.lineTo(x, y);
+  }
+  g.stroke();
+  g.setLineDash([]);
+  g.strokeStyle = "rgba(170,184,255,0.5)";
+  g.lineWidth = 2.5;
+  g.beginPath();
+  started = false;
+  for (let tf = data.nowTf; tf <= data.nextTf + 1e-6; tf += STEP) {
+    const x = X(tf);
+    const y = Y(tf);
+    if (!started) {
+      g.moveTo(x, y);
+      started = true;
+    } else g.lineTo(x, y);
+  }
+  g.stroke();
+
+  // faint intermediate phase nodes along the curve
+  const keyTf = [...data.resetTfs, data.nextTf, data.nowTf];
+  const n = 22;
+  for (let i = 0; i < n; i += 1) {
+    const tf = i / (n - 1);
+    if (keyTf.some((k) => Math.abs(k - tf) < 0.022)) continue;
+    orbitMoon(g, img, ready, X(tf), Y(tf), 13, data.illumAt(tf), { dim: tf > data.nowTf ? 0.5 : 0.72 });
+  }
+
+  // past resets — big real moons + ring + date
+  g.textAlign = "center";
+  for (let i = 0; i < data.resetTfs.length; i += 1) {
+    const tf = data.resetTfs[i];
+    const x = X(tf);
+    const y = Y(tf);
+    orbitMoon(g, img, ready, x, y, 30, 1, { ring: true, glow: true });
+    g.font = "600 11px 'JetBrains Mono', monospace";
+    g.fillStyle = "rgba(208,216,255,0.92)";
+    g.textBaseline = "alphabetic";
+    g.fillText("RESET", x, y - 42);
+    g.font = "500 11px 'JetBrains Mono', monospace";
+    g.fillStyle = "rgba(150,160,205,0.8)";
+    g.textBaseline = "top";
+    g.fillText(data.resetDates[i] ?? "", x, y + 38);
+  }
+
+  // predicted next — big dashed moon + date
+  {
+    const y = Y(data.nextTf);
+    orbitMoon(g, img, ready, estX, y, 30, 1, { dashed: true, glow: true });
+    g.font = "600 11px 'JetBrains Mono', monospace";
+    g.fillStyle = "rgba(168,182,255,0.98)";
+    g.textAlign = "center";
+    g.textBaseline = "alphabetic";
+    g.fillText("EST. RESET", estX, y - 42);
+    g.font = "500 11px 'JetBrains Mono', monospace";
+    g.fillStyle = "rgba(150,162,225,0.85)";
+    g.textBaseline = "top";
+    g.fillText(data.nextDate, estX, y + 38);
+  }
+
+  // NOW marker on the curve + days-to-next
+  {
+    const y = Y(data.nowTf);
+    g.strokeStyle = "rgba(210,218,255,0.8)";
+    g.lineWidth = 2;
+    g.setLineDash([2, 3]);
+    g.beginPath();
+    g.moveTo(nowX, y - 54);
+    g.lineTo(nowX, y + 54);
+    g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = "#0b0d16";
+    g.strokeStyle = "rgba(210,218,255,0.9)";
+    g.lineWidth = 2;
+    g.beginPath();
+    g.arc(nowX, y, 6, 0, 6.2832);
+    g.fill();
+    g.stroke();
+    g.font = "700 12px 'JetBrains Mono', monospace";
+    g.fillStyle = "#eef0ff";
+    g.textAlign = "center";
+    g.textBaseline = "alphabetic";
+    g.fillText("NOW", nowX, y - 62);
+    if (data.nextDays !== null) {
+      g.font = "700 13px 'JetBrains Mono', monospace";
+      g.fillStyle = "rgba(198,208,255,0.96)";
+      g.fillText(`${data.nextDays} DAYS`, (nowX + estX) / 2, Y((data.nowTf + data.nextTf) / 2) + 58);
     }
   }
-  return curve[curve.length - 1].v;
 }
-
-function buildAxisData(
-  trend: PredlogPoint[],
-  events: AxisEvent[],
-  nowMs: number,
-  currentChance: number
-): AxisData {
-  const pts = (trend ?? [])
-    .map((p) => ({ ms: Date.parse(p.at), chance: p.chance }))
-    .filter((p) => Number.isFinite(p.ms) && Number.isFinite(p.chance))
-    .sort((a, b) => a.ms - b.ms);
-  const evs = (events ?? [])
-    .map((e) => ({ ms: Date.parse(e.at), label: e.label }))
-    .filter((e) => Number.isFinite(e.ms))
-    .sort((a, b) => a.ms - b.ms);
-
-  // The domain follows the probability TREND (the predlog), not the much longer
-  // reset history — so the curve fills the axis and shows real movement instead
-  // of being squashed into a flat line at the right edge. Reset markers surface
-  // only once the trend window grows long enough to contain them (the full reset
-  // cadence already lives in the hero cards). A 12h floor keeps a sparse log
-  // readable; end = now.
-  const dataMin = pts.length ? pts[0].ms : nowMs - 36 * 3_600_000;
-  const tMin = Math.min(dataMin, nowMs - 12 * 3_600_000);
-  const span = Math.max(1, nowMs - tMin);
-  const tf = (ms: number) => clamp01((ms - tMin) / span);
-
-  const curve: AxisPoint[] = pts.map((p) => ({ tf: tf(p.ms), v: clamp01(p.chance / 100) }));
-  // Pin the right edge to the live chance so the curve meets the "current"
-  // callout exactly (the predlog's last hourly point can lag the live value).
-  curve.push({ tf: 1, v: clamp01(currentChance / 100) });
-  if (curve.length < 2) curve.unshift({ tf: 0, v: clamp01(currentChance / 100) });
-  const markers: AxisMarker[] = evs
-    .filter((e) => e.ms >= tMin && e.ms <= nowMs)
-    .map((e) => ({ tf: tf(e.ms), v: curve.length ? valueAt(curve, tf(e.ms)) : 0.5, label: e.label }));
-
-  // Time ticks: ~5 across the span, formatted by date.
-  const ticks: AxisTick[] = [];
-  const TICK_N = 5;
-  for (let i = 0; i <= TICK_N; i += 1) {
-    const f = i / TICK_N;
-    const ms = tMin + f * span;
-    ticks.push({ tf: f, text: i === TICK_N ? "NOW" : formatShortDate(ms).toUpperCase() });
-  }
-
-  return { curve, markers, ticks, spanDays: span / 86_400_000 };
-}
-
-type MouseState = { x: number; y: number };
 
 export function ForecastDashboard({
   initialSnapshot,
-  initialTrend = [],
   initialEvents = []
 }: ForecastDashboardProps) {
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
-  const [trend, setTrend] = useState<PredlogPoint[]>(initialTrend);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scrolled, setScrolled] = useState(false);
@@ -153,33 +391,32 @@ export function ForecastDashboard({
   const board = forecast.board ?? [];
   const chance = Math.min(100, Math.max(0, Math.round(forecast.chance)));
   const cadence = forecast.cadence;
+  const illum = clamp01(chance / 100);
 
   const reduce =
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // Axis data, recomputed when the trend/events change. nowMs is captured once
-  // on mount to keep SSR/CSR stable (no Date.now in render).
   const nowRef = useRef<number>(0);
   if (nowRef.current === 0) nowRef.current = Date.parse(forecast.generatedAt) || Date.now();
-  const axisData = useMemo(
-    () => buildAxisData(trend, initialEvents, nowRef.current, chance),
-    [trend, initialEvents, chance]
+  const moon = useMemo(
+    () => buildMoonData(initialEvents, cadence?.medianGapHours ?? null, nowRef.current),
+    [initialEvents, cadence]
   );
 
-  // Live data the rAF loop reads (updated without re-subscribing the loop).
-  const dataRef = useRef<{ axis: AxisData; chance: number }>({ axis: axisData, chance });
+  // Live values the rAF loop reads.
+  const dataRef = useRef<{ moon: MoonData; illum: number; chance: number }>({ moon, illum, chance });
   useEffect(() => {
-    dataRef.current = { axis: axisData, chance };
-  }, [axisData, chance]);
+    dataRef.current = { moon, illum, chance };
+  }, [moon, illum, chance]);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const mouseRef = useRef<MouseState>({ x: -9999, y: -9999 });
+  const rhythmRef = useRef<HTMLCanvasElement | null>(null);
   const boardRef = useRef<HTMLElement | null>(null);
   const footerRef = useRef<HTMLElement | null>(null);
 
-  // ── Particle field: cloud (screen 1) morphs into the axis (screen 2) ──────
+  // ── Lunar canvas: starfield + big moon (illum = chance) + phase timeline ────
   useEffect(() => {
     if (reduce) return;
     const cv = canvasRef.current;
@@ -191,151 +428,31 @@ export function ForecastDashboard({
       ctx = null;
     }
     if (!ctx) return;
+    const g = ctx;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     let W = 0;
     let H = 0;
-    const N = 1300;
-    const P: Array<{
-      ang: number;
-      rad: number;
-      speed: number;
-      phase: number;
-      size: number;
-      tilt: number;
-      ax: number;
-      ay: number;
-      role: string;
-      glow: number;
-      txX: number; // hero target — a point on the CODEX glyph cloud
-      txY: number;
-    }> = [];
-    for (let k = 0; k < N; k += 1) {
-      P.push({
-        ang: Math.random() * 6.2832,
-        rad: 0.16 + Math.random() * 0.62,
-        speed: (0.2 + Math.random() * 0.8) * (Math.random() < 0.5 ? 1 : -1),
-        phase: Math.random() * 6.2832,
-        size: 0.7 + Math.random() * 1.7,
-        tilt: 0.45 + Math.random() * 0.55,
-        ax: 0,
-        ay: 0,
-        role: "haze",
-        glow: 0.2,
-        txX: 0,
-        txY: 0
-      });
-    }
 
-    // Sample the word CODEX into a point cloud — the hero particles settle into
-    // these glyph points (then morph into the axis on scroll).
-    const TEXT_CX = () => W * 0.61;
-    const TEXT_CY = () => H * 0.36;
-    const sampleCodex = () => {
-      const off = document.createElement("canvas");
-      off.width = W;
-      off.height = H;
-      const octx = off.getContext("2d");
-      if (!octx) return;
-      const fontPx = Math.min(W * 0.068, 100);
-      octx.fillStyle = "#fff";
-      octx.font = `900 ${fontPx}px Inter, system-ui, sans-serif`;
-      octx.textAlign = "center";
-      octx.textBaseline = "middle";
-      octx.fillText("CODEX", TEXT_CX(), TEXT_CY());
-      let data: Uint8ClampedArray;
-      try {
-        data = octx.getImageData(0, 0, W, H).data;
-      } catch {
-        return;
-      }
-      const pts: Array<{ x: number; y: number }> = [];
-      const step = 6;
-      for (let y = 0; y < H; y += step) {
-        for (let x = 0; x < W; x += step) {
-          if (data[(y * W + x) * 4 + 3] > 110) pts.push({ x, y });
-        }
-      }
-      if (pts.length === 0) return;
-      // Shuffle so particles fill the whole word evenly even when N differs.
-      for (let k = N - 1; k > 0; k -= 1) {
-        const j = Math.floor(Math.random() * (k + 1));
-        [P[k], P[j]] = [P[j], P[k]];
-      }
-      for (let k = 0; k < N; k += 1) {
-        const tp = pts[k % pts.length];
-        P[k].txX = tp.x;
-        P[k].txY = tp.y;
-      }
+    let stars: Array<{ x: number; y: number; r: number; a: number; tw: number }> = [];
+    // real lunar near-side texture (NASA/GSFC/ASU LRO mosaic) — canvas only does
+    // the phase shading; all surface detail comes from the real photo
+    const moonImg = new Image();
+    moonImg.decoding = "async";
+    let moonReady = false;
+    moonImg.onload = () => {
+      moonReady = true;
     };
+    moonImg.src = "/moon.jpg";
 
-    const plot = { l: 0, r: 0, t: 0, b: 0, w: 0, h: 0 };
-    const px = (tf: number) => plot.l + tf * plot.w;
-    const py = (v: number) => plot.b - v * plot.h;
-
-    const recompute = () => {
-      plot.l = W * 0.1;
-      plot.r = W * 0.9; // leave room on the right for the "current" price tag
-      plot.t = H * 0.3;
-      plot.b = H * 0.84;
-      plot.w = plot.r - plot.l;
-      plot.h = plot.b - plot.t;
-
-      const { axis } = dataRef.current;
-      const curve = axis.curve;
-      let i = 0;
-      const set = (count: number, fn: (p: (typeof P)[number], k: number, c: number) => void) => {
-        for (let k = 0; k < count && i < N; k += 1, i += 1) fn(P[i], k, count);
-      };
-
-      // curve spine — sample the real curve (or a flat line at current chance)
-      set(300, (p, k, c) => {
-        const tf = k / (c - 1);
-        const v = curve.length >= 2 ? valueAt(curve, tf) : dataRef.current.chance / 100;
-        p.role = "curve";
-        p.ax = px(tf);
-        p.ay = py(v);
-        p.glow = 1;
-      });
-      set(150, (p, k, c) => {
-        p.role = "x";
-        p.ax = plot.l + (k / (c - 1)) * plot.w;
-        p.ay = plot.b;
-        p.glow = 0.7;
-      });
-      set(110, (p, k, c) => {
-        p.role = "y";
-        p.ax = plot.l;
-        p.ay = plot.b - (k / (c - 1)) * plot.h;
-        p.glow = 0.7;
-      });
-      set(140, (p) => {
-        const gx = Math.floor(Math.random() * 9) / 8;
-        const gy = Math.floor(Math.random() * 5) / 4;
-        p.role = "grid";
-        p.ax = px(gx);
-        p.ay = py(gy);
-        p.glow = 0.22;
-      });
-      // node clusters at the real event markers
-      const markers = axis.markers.length ? axis.markers : [{ tf: 1, v: dataRef.current.chance / 100, label: "" }];
-      set(80, (p, k) => {
-        const nd = markers[k % markers.length];
-        const a = Math.random() * 6.28;
-        const rr = Math.random() * 8;
-        p.role = "node";
-        p.ax = px(nd.tf) + Math.cos(a) * rr;
-        p.ay = py(nd.v) + Math.sin(a) * rr;
-        p.glow = 1;
-      });
-      set(N - i, (p) => {
-        const tf = Math.random();
-        const v = curve.length >= 2 ? valueAt(curve, tf) : dataRef.current.chance / 100;
-        p.role = "haze";
-        p.ax = px(tf);
-        p.ay = py(Math.random() * v);
-        p.glow = 0.12;
-      });
+    const seedStars = () => {
+      stars = Array.from({ length: 150 }, () => ({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.3 + 0.2,
+        a: Math.random() * 0.5 + 0.15,
+        tw: Math.random() * 6.28
+      }));
     };
 
     const resize = () => {
@@ -343,286 +460,117 @@ export function ForecastDashboard({
       H = window.innerHeight;
       cv.width = Math.round(W * dpr);
       cv.height = Math.round(H * dpr);
-      ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
-      recompute();
-      sampleCodex();
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      seedStars();
     };
     resize();
     window.addEventListener("resize", resize);
 
-    let prog = 0;
-    let progT = 0;
     const onScroll = () => {
-      const vh = window.innerHeight;
-      const start = vh * 0.5;
-      const spanPx = vh * 0.9;
-      progT = clamp01((window.scrollY - start) / spanPx);
-      if (window.scrollY > 80) setScrolled(true);
-      // Fade the field out before the Forecast Board scrolls in, so the axis
-      // never bleeds over the footer (whose width is capped). axis-screen ends
-      // at ~3.1vh; fade across 2.3–3.0vh.
-      cv.style.opacity = String(clamp01(1 - (window.scrollY - vh * 2.3) / (vh * 0.7)));
+      if (!scrolled && window.scrollY > 80) setScrolled(true);
+      // fade the sky out before the board scrolls in
+      cv.style.opacity = String(clamp01(1 - (window.scrollY - window.innerHeight * 0.55) / (window.innerHeight * 0.6)));
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     onScroll();
 
-    const mouse = mouseRef.current;
-    const onMove = (e: PointerEvent) => {
-      mouse.x = e.clientX;
-      mouse.y = e.clientY;
-      document.documentElement.style.setProperty("--mx", `${e.clientX}px`);
-      document.documentElement.style.setProperty("--my", `${e.clientY}px`);
-    };
-    window.addEventListener("pointermove", onMove, { passive: true });
+    const MX = () => W * 0.6;
+    const MY = () => H * 0.4;
+    const MR = () => Math.min(W, H) * 0.275;
 
-    const ease = (p: number) => {
-      p = clamp01(p);
-      return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+    // draw a moon disc with illuminated fraction f (waxing = lit on the right)
+    const drawMoon = (cx: number, cy: number, R: number, f: number, t: number) => {
+      // two-layer cool halo
+      const h1 = g.createRadialGradient(cx, cy, R * 0.84, cx, cy, R * (1.22 + f * 0.45));
+      h1.addColorStop(0, `rgba(198,212,255,${0.04 + f * 0.15})`);
+      h1.addColorStop(1, "rgba(198,212,255,0)");
+      g.fillStyle = h1;
+      g.beginPath();
+      g.arc(cx, cy, R * (1.22 + f * 0.45), 0, 6.2832);
+      g.fill();
+      const h2 = g.createRadialGradient(cx, cy, R * 0.6, cx, cy, R * (1.9 + f));
+      h2.addColorStop(0, `rgba(150,170,255,${0.02 + f * 0.05})`);
+      h2.addColorStop(1, "rgba(150,170,255,0)");
+      g.fillStyle = h2;
+      g.beginPath();
+      g.arc(cx, cy, R * (1.9 + f), 0, 6.2832);
+      g.fill();
+
+      g.save();
+      g.beginPath();
+      g.arc(cx, cy, R, 0, 6.2832);
+      g.clip();
+
+      if (moonReady) {
+        // real moon, scaled up a touch so the corner credit text falls outside the disc;
+        // brighten + a hair of contrast so the grey surface reads brightly on black
+        const s = 2 * R * 1.08;
+        g.filter = "brightness(1.5) contrast(1.05)";
+        g.drawImage(moonImg, cx - s / 2, cy - s / 2, s, s);
+        g.filter = "none";
+        // faint cool unify with the site palette (stays natural)
+        g.globalCompositeOperation = "soft-light";
+        g.fillStyle = "rgba(204,220,255,0.4)";
+        g.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+        g.globalCompositeOperation = "source-over";
+      } else {
+        g.fillStyle = "#c7ccd9";
+        g.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+      }
+
+      // night side — dim the real texture into a faint earthshine-lit dark side,
+      // soft terminator via blur. waxing → lit on the right.
+      g.save();
+      g.filter = `blur(${Math.max(1, R * 0.018)}px)`;
+      g.fillStyle = "rgba(9,12,26,0.8)";
+      if (f <= 0.5) {
+        // night = left half ∪ central ellipse (single non-zero fill, alpha not doubled)
+        g.beginPath();
+        g.rect(cx - R - 2, cy - R - 2, R + 2, 2 * R + 4);
+        g.ellipse(cx, cy, R * (1 - 2 * f), R, 0, 0, 6.2832);
+        g.fill();
+      } else {
+        // night = left half ∩ outside(lit ellipse) = thin left crescent
+        g.save();
+        g.beginPath();
+        g.rect(cx - R - 2, cy - R - 2, R + 2, 2 * R + 4);
+        g.clip();
+        g.beginPath();
+        g.rect(cx - 2 * R, cy - 2 * R, 4 * R, 4 * R);
+        g.ellipse(cx, cy, R * (2 * f - 1), R, 0, 0, 6.2832);
+        g.clip("evenodd");
+        g.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+        g.restore();
+      }
+      g.filter = "none";
+      g.restore();
+
+      g.restore();
+      // faint cool rim
+      g.strokeStyle = "rgba(200,214,255,0.12)";
+      g.lineWidth = Math.max(1, R * 0.005);
+      g.beginPath();
+      g.arc(cx, cy, R, 0, 6.2832);
+      g.stroke();
+      void t;
     };
-    const roundRect = (c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) => {
-      c.beginPath();
-      c.moveTo(x + r, y);
-      c.arcTo(x + w, y, x + w, y + h, r);
-      c.arcTo(x + w, y + h, x, y + h, r);
-      c.arcTo(x, y + h, x, y, r);
-      c.arcTo(x, y, x + w, y, r);
-      c.closePath();
-    };
+
+    // the reset-rhythm timeline now lives on its own second-screen canvas
+    // (see the module-level drawResetTimeline + the rhythm useEffect below)
 
     let t = 0;
     let raf = 0;
-
-    const drawAxis = (la: number) => {
-      const { axis, chance: cur } = dataRef.current;
-      const curve = axis.curve;
-      const hasCurve = curve.length >= 2;
-
-      // grid
-      ctx!.strokeStyle = `rgba(124,137,240,${0.07 * la})`;
-      ctx!.lineWidth = 1;
-      for (const v of [0.25, 0.5, 0.75, 1]) {
-        ctx!.beginPath();
-        ctx!.moveTo(plot.l, py(v));
-        ctx!.lineTo(plot.r, py(v));
-        ctx!.stroke();
-      }
-      for (let g = 1; g <= 8; g += 1) {
-        const x = plot.l + (g / 8) * plot.w;
-        ctx!.beginPath();
-        ctx!.moveTo(x, plot.t);
-        ctx!.lineTo(x, plot.b);
-        ctx!.stroke();
-      }
-
-      // glowing axes
-      ctx!.save();
-      ctx!.shadowColor = `rgba(124,137,240,${0.95 * la})`;
-      ctx!.shadowBlur = 26;
-      ctx!.strokeStyle = `rgba(192,200,255,${0.96 * la})`;
-      ctx!.lineWidth = 2.6;
-      ctx!.beginPath();
-      ctx!.moveTo(plot.l, plot.t - 8);
-      ctx!.lineTo(plot.l, plot.b);
-      ctx!.lineTo(plot.r + 8, plot.b);
-      ctx!.stroke();
-      ctx!.restore();
-
-      if (hasCurve) {
-        // area fill
-        const grd = ctx!.createLinearGradient(0, plot.t, 0, plot.b);
-        grd.addColorStop(0, `rgba(124,137,240,${0.22 * la})`);
-        grd.addColorStop(1, "rgba(124,137,240,0)");
-        ctx!.beginPath();
-        ctx!.moveTo(plot.l, plot.b);
-        for (let s = 0; s <= 80; s += 1) {
-          const tf = s / 80;
-          ctx!.lineTo(px(tf), py(valueAt(curve, tf)));
-        }
-        ctx!.lineTo(px(1), plot.b);
-        ctx!.closePath();
-        ctx!.fillStyle = grd;
-        ctx!.fill();
-
-        // glowing curve
-        ctx!.save();
-        ctx!.shadowColor = `rgba(139,150,255,${la})`;
-        ctx!.shadowBlur = 30;
-        const cg = ctx!.createLinearGradient(plot.l, 0, plot.r, 0);
-        cg.addColorStop(0, `rgba(150,162,240,${0.75 * la})`);
-        cg.addColorStop(1, `rgba(214,221,255,${la})`);
-        ctx!.strokeStyle = cg;
-        ctx!.lineWidth = 3.4;
-        ctx!.lineJoin = "round";
-        ctx!.beginPath();
-        for (let s = 0; s <= 160; s += 1) {
-          const tf = s / 160;
-          const x = px(tf);
-          const y = py(valueAt(curve, tf));
-          s ? ctx!.lineTo(x, y) : ctx!.moveTo(x, y);
-        }
-        ctx!.stroke();
-        ctx!.restore();
-      }
-
-      // y ticks + x labels
-      ctx!.font = "500 12px 'JetBrains Mono', monospace";
-      ctx!.fillStyle = `rgba(150,156,176,${0.7 * la})`;
-      ctx!.textAlign = "right";
-      ctx!.textBaseline = "middle";
-      for (const v of [0, 0.25, 0.5, 0.75, 1]) ctx!.fillText(`${v * 100}%`, plot.l - 14, py(v));
-      ctx!.textAlign = "center";
-      ctx!.textBaseline = "top";
-      for (const tick of axis.ticks) ctx!.fillText(tick.text, px(tick.tf), plot.b + 14);
-
-      // event annotation chips
-      ctx!.textBaseline = "middle";
-      for (const nd of axis.markers) {
-        const x = px(nd.tf);
-        const y = py(nd.v);
-        ctx!.strokeStyle = `rgba(124,137,240,${0.4 * la})`;
-        ctx!.lineWidth = 1;
-        ctx!.setLineDash([2, 4]);
-        ctx!.beginPath();
-        ctx!.moveTo(x, y);
-        ctx!.lineTo(x, y - 34);
-        ctx!.stroke();
-        ctx!.setLineDash([]);
-        ctx!.font = "500 11px 'JetBrains Mono', monospace";
-        const tw = ctx!.measureText(nd.label).width + 18;
-        ctx!.fillStyle = `rgba(16,18,30,${0.85 * la})`;
-        roundRect(ctx!, x - tw / 2, y - 56, tw, 22, 6);
-        ctx!.fill();
-        ctx!.strokeStyle = `rgba(255,255,255,${0.08 * la})`;
-        ctx!.stroke();
-        ctx!.fillStyle = `rgba(200,206,235,${la})`;
-        ctx!.textAlign = "center";
-        ctx!.fillText(nd.label, x, y - 45);
-      }
-
-      // ── Current readout: a living pulse on the curve end + a price tag
-      //    pinned in the right gutter, so the number never sits under the dot. ──
-      const cxp = px(1);
-      const cyp = py(hasCurve ? valueAt(curve, 1) : cur / 100);
-
-      // expanding pulse rings (the forecast is "live")
-      for (let ri = 0; ri < 2; ri += 1) {
-        const pr = (t * 0.55 + ri * 0.5) % 1;
-        ctx!.strokeStyle = `rgba(139,150,255,${(1 - pr) * 0.5 * la})`;
-        ctx!.lineWidth = 1.5;
-        ctx!.beginPath();
-        ctx!.arc(cxp, cyp, 5 + pr * 26, 0, 6.2832);
-        ctx!.stroke();
-      }
-      // glowing node
-      ctx!.save();
-      ctx!.shadowColor = `rgba(160,170,255,${la})`;
-      ctx!.shadowBlur = 18;
-      ctx!.fillStyle = `rgba(236,239,255,${la})`;
-      ctx!.beginPath();
-      ctx!.arc(cxp, cyp, 5, 0, 6.2832);
-      ctx!.fill();
-      ctx!.restore();
-
-      // horizontal guide to the tag in the right gutter
-      const tagW = 96;
-      const tagH = 52;
-      const tagX = Math.min(W - tagW - 12, cxp + 24);
-      const tagY = Math.max(plot.t, Math.min(plot.b - tagH, cyp - tagH / 2));
-      ctx!.strokeStyle = `rgba(139,150,255,${0.4 * la})`;
-      ctx!.lineWidth = 1;
-      ctx!.setLineDash([2, 5]);
-      ctx!.beginPath();
-      ctx!.moveTo(cxp + 7, cyp);
-      ctx!.lineTo(tagX, cyp);
-      ctx!.stroke();
-      ctx!.setLineDash([]);
-
-      // tag card with a pointer notch toward the curve
-      ctx!.save();
-      ctx!.shadowColor = `rgba(108,120,240,${0.55 * la})`;
-      ctx!.shadowBlur = 22;
-      ctx!.fillStyle = `rgba(12,14,26,${0.95 * la})`;
-      roundRect(ctx!, tagX, tagY, tagW, tagH, 12);
-      ctx!.fill();
-      ctx!.restore();
-      ctx!.strokeStyle = `rgba(139,150,255,${0.6 * la})`;
-      ctx!.lineWidth = 1.25;
-      roundRect(ctx!, tagX, tagY, tagW, tagH, 12);
-      ctx!.stroke();
-      ctx!.fillStyle = `rgba(12,14,26,${0.95 * la})`;
-      ctx!.beginPath();
-      ctx!.moveTo(tagX + 1, cyp - 6);
-      ctx!.lineTo(tagX - 7, cyp);
-      ctx!.lineTo(tagX + 1, cyp + 6);
-      ctx!.closePath();
-      ctx!.fill();
-
-      // big number + label + accent underline
-      ctx!.fillStyle = `rgba(236,239,255,${la})`;
-      ctx!.font = "800 27px Inter, sans-serif";
-      ctx!.textAlign = "center";
-      ctx!.textBaseline = "middle";
-      ctx!.fillText(`${cur}%`, tagX + tagW / 2, tagY + tagH * 0.4);
-      ctx!.font = "600 8px 'JetBrains Mono', monospace";
-      ctx!.fillStyle = `rgba(176,184,255,${0.9 * la})`;
-      ctx!.fillText("CURRENT", tagX + tagW / 2, tagY + tagH * 0.72);
-      ctx!.strokeStyle = `rgba(139,150,255,${0.75 * la})`;
-      ctx!.lineWidth = 2;
-      ctx!.beginPath();
-      ctx!.moveTo(tagX + tagW * 0.32, tagY + tagH - 9);
-      ctx!.lineTo(tagX + tagW * 0.68, tagY + tagH - 9);
-      ctx!.stroke();
-    };
-
     const frame = () => {
       t += 0.016;
-      prog += (progT - prog) * 0.08;
-      const e = ease(prog);
-
-      ctx!.clearRect(0, 0, W, H);
-      ctx!.globalCompositeOperation = "lighter";
-
-      // Soft halo behind the CODEX word, fading as the cloud morphs to the axis.
-      if (e < 0.6) {
-        const coreA = 1 - e / 0.6;
-        const cr = Math.min(W, H) * 0.27 * (1 + Math.sin(t * 1.1) * 0.05);
-        const g = ctx!.createRadialGradient(TEXT_CX(), TEXT_CY(), 0, TEXT_CX(), TEXT_CY(), cr);
-        g.addColorStop(0, `rgba(120,132,250,${0.13 * coreA})`);
-        g.addColorStop(1, "rgba(108,120,240,0)");
-        ctx!.fillStyle = g;
-        ctx!.beginPath();
-        ctx!.arc(TEXT_CX(), TEXT_CY(), cr, 0, 6.2832);
-        ctx!.fill();
+      g.clearRect(0, 0, W, H);
+      for (const s of stars) {
+        const a = s.a * (0.6 + 0.4 * Math.sin(t * 0.8 + s.tw));
+        g.fillStyle = `rgba(200,206,255,${a})`;
+        g.beginPath();
+        g.arc(s.x, s.y, s.r, 0, 6.2832);
+        g.fill();
       }
-
-      for (const p of P) {
-        // hero: rest on the CODEX glyph with a soft shimmer; morph to axis by e
-        const hx = p.txX + Math.sin(t * 0.9 + p.phase) * 1.6;
-        const hy = p.txY + Math.cos(t * 0.8 + p.phase) * 1.6;
-        let x = hx + (p.ax - hx) * e;
-        let y = hy + (p.ay - hy) * e;
-        const dx = x - mouse.x;
-        const dy = y - mouse.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < 9000) {
-          const f = (1 - d2 / 9000) * 12 * (1 - e * 0.7);
-          const d = Math.sqrt(d2) || 1;
-          x += (dx / d) * f;
-          y += (dy / d) * f;
-        }
-        const tw = 0.65 + Math.sin(t * 1.7 + p.phase) * 0.35;
-        const settle = p.role === "x" || p.role === "y" || p.role === "grid" ? 1 - e * 0.55 : 1;
-        const al = (0.12 + p.glow * 0.55) * tw * settle * (p.role === "haze" ? 1 - e * 0.4 : 1);
-        const bright = p.role === "curve" || p.role === "node";
-        ctx!.beginPath();
-        ctx!.arc(x, y, p.size * (bright ? 1.3 : 1), 0, 6.2832);
-        ctx!.fillStyle = bright ? `rgba(198,208,255,${al})` : `rgba(150,162,240,${al})`;
-        ctx!.fill();
-      }
-
-      ctx!.globalCompositeOperation = "source-over";
-      if (e > 0.35) drawAxis((e - 0.35) / 0.65);
-
+      drawMoon(MX(), MY(), MR(), dataRef.current.illum, t);
       raf = window.requestAnimationFrame(frame);
     };
     raf = window.requestAnimationFrame(frame);
@@ -631,9 +579,49 @@ export function ForecastDashboard({
       window.cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
       window.removeEventListener("scroll", onScroll);
-      window.removeEventListener("pointermove", onMove);
     };
-  }, [reduce]);
+  }, [reduce, scrolled]);
+
+  // ── Reset-rhythm canvas (its own second screen) ───────────────────────────
+  useEffect(() => {
+    if (reduce) return;
+    const cv = rhythmRef.current;
+    if (!cv) return;
+    const ctx = cv.getContext("2d");
+    if (!ctx) return;
+    const g = ctx;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const moonImg = new Image();
+    moonImg.decoding = "async";
+    let ready = false;
+    const render = () => {
+      const rect = cv.getBoundingClientRect();
+      const W = Math.max(320, rect.width);
+      const H = Math.max(160, rect.height);
+      cv.width = Math.round(W * dpr);
+      cv.height = Math.round(H * dpr);
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, W, H);
+      for (let i = 0; i < 60; i += 1) {
+        const sx = (i * 71.3) % W;
+        const sy = (i * 47.7) % H;
+        const a = 0.05 + ((i * 37) % 50) / 320;
+        g.fillStyle = `rgba(200,206,255,${a})`;
+        g.beginPath();
+        g.arc(sx, sy, (((i * 13) % 10) / 10) * 0.7 + 0.2, 0, 6.2832);
+        g.fill();
+      }
+      drawResetTimeline(g, W, H, moon, moonImg, ready);
+    };
+    moonImg.onload = () => {
+      ready = true;
+      render();
+    };
+    moonImg.src = "/moon.jpg";
+    render();
+    window.addEventListener("resize", render);
+    return () => window.removeEventListener("resize", render);
+  }, [reduce, moon]);
 
   // Scroll reveal for the board / footer.
   useEffect(() => {
@@ -663,15 +651,6 @@ export function ForecastDashboard({
       if (!response.ok) throw new Error("Snapshot refresh failed.");
       const next = (await response.json()) as Snapshot;
       setSnapshot(next);
-      try {
-        const trendResponse = await fetch("/api/trend", { cache: "no-store" });
-        if (trendResponse.ok) {
-          const payload = (await trendResponse.json()) as { points?: PredlogPoint[] };
-          if (Array.isArray(payload.points)) setTrend(payload.points);
-        }
-      } catch {
-        // Trend refresh is best-effort.
-      }
     } catch {
       setError("Could not refresh. Try again shortly.");
     } finally {
@@ -683,21 +662,7 @@ export function ForecastDashboard({
     () => snapshot.collectors.filter((collector) => collector.ok).length,
     [snapshot.collectors]
   );
-
-  // Hero supporting figures (all real).
-  const weekDelta = useMemo(() => {
-    const pts = (trend ?? []).filter((p) => Number.isFinite(p.chance));
-    if (pts.length < 2) return null;
-    return pts[pts.length - 1].chance - pts[0].chance;
-  }, [trend]);
   const cadenceDays = cadence ? Math.round(cadence.medianGapHours / 24) : null;
-  const lastResetMs = useMemo(() => {
-    const evs = (initialEvents ?? [])
-      .map((e) => Date.parse(e.at))
-      .filter((ms) => Number.isFinite(ms));
-    return evs.length ? Math.max(...evs) : null;
-  }, [initialEvents]);
-  const qualityPct = Math.min(100, board.length ? 35 : 12); // calibrating: grows with resolved data
 
   return (
     <>
@@ -717,7 +682,7 @@ export function ForecastDashboard({
           </span>
         </nav>
 
-        {/* ═══ Screen 1: professional hero ═══ */}
+        {/* ═══ Screen 1: lunar hero ═══ */}
         <section className="hero" aria-labelledby="hero-title">
           <div className="hero-left">
             <span className="hero-tag">
@@ -730,122 +695,55 @@ export function ForecastDashboard({
               RESET?
             </h1>
             <p className="hero-sub">
-              We turn real-world signals into a live probability for the one question that matters:
-              when does OpenAI reset Codex limits.
+              Codex resets on a cycle, like a moon. The disc fills as the next reset nears — a full
+              disc means it&apos;s due.
             </p>
             <div
-              className="hero-readout"
+              className="phase-read"
               role="img"
-              aria-label={`Current reset probability ${chance} percent`}
+              aria-label={`Reset probability ${chance} percent — ${phaseName(illum)}`}
             >
-              <span className="hero-figure">
-                {chance}
-                <span className="pct">%</span>
+              <div className="phase-name">
+                <span>Current phase</span>
+                {phaseName(illum)}
+              </div>
+              <div className="phase-illum">
+                <b>{chance}%</b> illuminated
+              </div>
+            </div>
+            <div className="next-reset">
+              <span className="ic" aria-hidden="true">
+                🌕
               </span>
-              <span className="hero-readout-label">
-                Current
-                <br />
-                probability
+              <span>
+                <span className="lab">Next full disc · est. reset</span>
+                <span className="val">
+                  {moon.nextDays !== null ? `in ~${moon.nextDays} days` : "estimating…"}
+                </span>
+                <span className="sm" suppressHydrationWarning>
+                  {cadenceDays ? `~${cadenceDays}-day cycle` : "cycle forming"}
+                  {moon.lastResetMs ? ` · last reset ${formatShortDate(moon.lastResetMs)}` : ""}
+                </span>
               </span>
             </div>
-            {weekDelta !== null ? (
-              <div className="hero-trend">
-                <span className="pill">
-                  {weekDelta >= 0 ? "↗" : "↘"} {weekDelta >= 0 ? "+" : ""}
-                  {weekDelta}% recent
-                </span>
-                <span style={{ color: "var(--muted)" }}>{forecast.window}</span>
-              </div>
-            ) : null}
-            <div className="hero-meta" suppressHydrationWarning>
-              <span>Updated {formatGeneratedAt(forecast.generatedAt)}</span>
-              <span className="sep">·</span>
-              <span>{okCollectors} sources tracked</span>
-              {cadenceDays ? (
-                <>
-                  <span className="sep">·</span>
-                  <span>~{cadenceDays}-day cadence</span>
-                </>
-              ) : null}
-            </div>
-            {cadenceDays ? (
-              <div className="hero-card-deadline">
-                <span className="ic" aria-hidden="true">
-                  ◷
-                </span>
-                <span>
-                  <span className="lab">Typical cadence</span>
-                  <span className="val">~{cadenceDays} days between resets</span>
-                  <span className="sm" suppressHydrationWarning>
-                    {lastResetMs ? `Last fleet-wide reset · ${formatShortDate(lastResetMs)}` : "Awaiting reset history"}
-                  </span>
-                </span>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="hero-cards" aria-hidden="true">
-            <div className="card">
-              <div className="card-head">
-                <span>Forecast quality</span>
-                <span className="q">i</span>
-              </div>
-              <div className="card-quality">
-                <div>
-                  <div className="card-big">Calibrating</div>
-                  <div className="card-sub">Accruing a track record across resets</div>
-                </div>
-                <svg className="quality-ring" viewBox="0 0 56 56">
-                  <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="3" />
-                  <circle
-                    cx="28"
-                    cy="28"
-                    r="22"
-                    fill="none"
-                    stroke="#8b96ff"
-                    strokeWidth="3"
-                    strokeDasharray={`${(qualityPct / 100) * 138} 200`}
-                    strokeLinecap="round"
-                    transform="rotate(-90 28 28)"
-                  />
-                </svg>
-              </div>
-            </div>
-            <div className="card">
-              <div className="card-head">
-                <span>Reset cadence</span>
-                <span className="q">i</span>
-              </div>
-              <div className="card-big">
-                {cadenceDays ? `~${cadenceDays}d` : "—"}
-              </div>
-              <div className="card-sub">
-                {cadence
-                  ? `Median gap across ${cadence.nResets} fleet-wide resets`
-                  : "Cadence appears after enough resets are logged"}
-              </div>
-            </div>
-          </div>
-
-          <div className={`scroll-cue ${scrolled ? "hidden" : ""}`} aria-hidden="true">
-            <span>Scroll · signals become structure</span>
-            <svg viewBox="0 0 14 14">
-              <path d="M3 5l4 4 4-4" />
-            </svg>
           </div>
         </section>
 
-        {/* ═══ Screen 2: the axis forms here (canvas draws it) ═══ */}
-        <section className="axis-screen" aria-label="Probability history">
-          <div className="axis-title">
-            <div>
-              <span className="axis-kicker">Probability field</span>
-              <h1 className="axis-h">Signals, resolved into one coordinate.</h1>
+        {/* ═══ Screen 2: reset rhythm ═══ */}
+        <section className="rhythm" id="rhythm" aria-labelledby="rhythm-title">
+          <div className="rhythm-inner">
+            <div className="rhythm-head">
+              <div className="rhythm-title">
+                Reset rhythm
+                <b id="rhythm-title">Every full disc is a reset</b>
+              </div>
+              <div className="rhythm-legend">
+                Codex resets every {cadenceDays ? `~${cadenceDays}` : "~13"} days
+                <br />
+                Past resets · now · predicted next
+              </div>
             </div>
-            <p className="axis-note">
-              The drifting cloud settles onto a single axis — time against probability. Where there
-              was chaos, a line of judgement.
-            </p>
+            <canvas ref={rhythmRef} className="rhythm-field" aria-hidden="true" />
           </div>
         </section>
 
@@ -947,6 +845,9 @@ export function ForecastDashboard({
           <p className="disclaimer">
             Unofficial. Not affiliated with OpenAI. Every figure is an estimate from public signals,
             not an official notice.
+          </p>
+          <p className="disclaimer" style={{ opacity: 0.65 }}>
+            Moon imagery: NASA/GSFC/Arizona State University · Lunar Reconnaissance Orbiter.
           </p>
         </footer>
       </div>
