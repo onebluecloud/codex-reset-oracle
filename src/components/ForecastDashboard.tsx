@@ -89,6 +89,8 @@ type MoonData = {
   nextWindowTf: number;
   /** ±1σ reset-window half-width in days (for the label). */
   nextWindowDays: number;
+  /** Predicted reset is already in the past (no new reset recorded yet). */
+  overdue: boolean;
 };
 
 function buildMoonData(
@@ -104,13 +106,18 @@ function buildMoonData(
   const cadenceMs = (cadenceHours ?? 13 * 24) * 3_600_000;
   const lastResetMs = resets.length ? resets[resets.length - 1] : null;
 
-  // Predicted next reset = last reset + cadence (at least a little ahead of now).
-  const predictedNext = lastResetMs ? Math.max(lastResetMs + cadenceMs, nowMs + 3_600_000) : nowMs + cadenceMs;
-  const nextDays = Math.max(0, Math.round((predictedNext - nowMs) / 86_400_000));
+  // Predicted next reset = last reset + cadence. Do NOT floor it to "now": an
+  // overdue prediction must read as "overdue", not silently drift forward a day
+  // every day (which pinned EST. RESET to "today · 0 days" forever).
+  const predictedNext = lastResetMs ? lastResetMs + cadenceMs : nowMs + cadenceMs;
+  const nextDays = Math.round((predictedNext - nowMs) / 86_400_000); // negative = overdue
+  const overdue = predictedNext < nowMs;
 
   // Band domain: a couple of cycles of history through the predicted next reset.
   const tMin = resets.length ? Math.min(resets[0], nowMs - cadenceMs) : nowMs - cadenceMs * 2;
-  const tMax = predictedNext;
+  // Domain must reach past whichever is later — the prediction OR now — so an
+  // overdue "now" still sits on the curve (to the right of the predicted full moon).
+  const tMax = Math.max(predictedNext, nowMs) + cadenceMs * 0.18;
   const span = Math.max(1, tMax - tMin);
   const toTf = (ms: number) => clamp01((ms - tMin) / span);
   // ±1σ reset-window: shows the prediction is a spread, not a fixed day.
@@ -144,7 +151,8 @@ function buildMoonData(
     resetDates: resets.map(formatShortDate),
     nextDate: formatShortDate(predictedNext),
     nextWindowTf,
-    nextWindowDays
+    nextWindowDays,
+    overdue
   };
 }
 
@@ -409,8 +417,9 @@ function drawResetTimeline(
     g.fillText("NOW", nowX, y - 62);
     if (data.nextDays !== null) {
       g.font = "700 13px 'JetBrains Mono', monospace";
-      g.fillStyle = "rgba(198,208,255,0.96)";
-      g.fillText(`${data.nextDays} DAYS`, (nowX + estX) / 2, Y((data.nowTf + data.nextTf) / 2) + 58);
+      g.fillStyle = data.overdue ? "rgba(255,200,140,0.95)" : "rgba(198,208,255,0.96)";
+      const daysLabel = data.overdue ? `OVERDUE ${Math.abs(data.nextDays)}D` : `${data.nextDays} DAYS`;
+      g.fillText(daysLabel, (nowX + estX) / 2, Y((data.nowTf + data.nextTf) / 2) + 58);
     }
   }
 }
@@ -786,11 +795,19 @@ export function ForecastDashboard({
               <span>
                 <span className="lab">Next full disc · est. reset</span>
                 <span className="val">
-                  {moon.nextDays !== null ? `in ~${moon.nextDays} days` : "estimating…"}
+                  {moon.overdue
+                    ? `overdue ~${Math.abs(moon.nextDays ?? 0)}d`
+                    : moon.nextDays !== null
+                      ? `in ~${moon.nextDays} days`
+                      : "estimating…"}
                 </span>
                 <span className="sm" suppressHydrationWarning>
                   {cadenceDays ? `~${cadenceDays}-day cycle` : "cycle forming"}
-                  {moon.lastResetMs ? ` · last reset ${formatShortDate(moon.lastResetMs)}` : ""}
+                  {moon.overdue
+                    ? " · awaiting reset record"
+                    : moon.lastResetMs
+                      ? ` · last reset ${formatShortDate(moon.lastResetMs)}`
+                      : ""}
                 </span>
               </span>
             </div>
