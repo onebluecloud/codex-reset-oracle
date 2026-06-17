@@ -85,12 +85,17 @@ type MoonData = {
   resetDates: string[];
   /** Short date label for the predicted next reset. */
   nextDate: string;
+  /** Half-width (band time-fraction) of the ±1σ reset window. */
+  nextWindowTf: number;
+  /** ±1σ reset-window half-width in days (for the label). */
+  nextWindowDays: number;
 };
 
 function buildMoonData(
   events: AxisEvent[],
   cadenceHours: number | null,
-  nowMs: number
+  nowMs: number,
+  sigHours: number | null = null
 ): MoonData {
   const resets = (events ?? [])
     .map((e) => Date.parse(e.at))
@@ -108,6 +113,9 @@ function buildMoonData(
   const tMax = predictedNext;
   const span = Math.max(1, tMax - tMin);
   const toTf = (ms: number) => clamp01((ms - tMin) / span);
+  // ±1σ reset-window: shows the prediction is a spread, not a fixed day.
+  const nextWindowTf = clamp01(((sigHours ?? 0) * 3_600_000) / span);
+  const nextWindowDays = Math.round((sigHours ?? 0) / 24);
 
   // anchor full moons = real resets + the predicted next one
   const fullMoons = [...resets, predictedNext].sort((a, b) => a - b);
@@ -134,7 +142,9 @@ function buildMoonData(
     nextDays,
     lastResetMs,
     resetDates: resets.map(formatShortDate),
-    nextDate: formatShortDate(predictedNext)
+    nextDate: formatShortDate(predictedNext),
+    nextWindowTf,
+    nextWindowDays
   };
 }
 
@@ -332,6 +342,33 @@ function drawResetTimeline(
     g.fillText(data.resetDates[i] ?? "", x, y + 38);
   }
 
+  // ±1σ reset window — the prediction is a spread, not a fixed day
+  if (data.nextWindowTf > 0) {
+    const ey = Y(data.nextTf);
+    const sigPx = Math.max(48, data.nextWindowTf * width);
+    const wb = g.createRadialGradient(estX, ey, 0, estX, ey, sigPx);
+    wb.addColorStop(0, "rgba(150,168,255,0.17)");
+    wb.addColorStop(0.6, "rgba(150,168,255,0.06)");
+    wb.addColorStop(1, "rgba(150,168,255,0)");
+    g.fillStyle = wb;
+    g.beginPath();
+    g.ellipse(estX, ey, sigPx, 30, 0, 0, 6.2832);
+    g.fill();
+    g.setLineDash([2, 4]);
+    g.strokeStyle = "rgba(150,168,255,0.3)";
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(estX - sigPx, ey);
+    g.lineTo(estX + sigPx, ey);
+    g.stroke();
+    g.setLineDash([]);
+    g.font = "500 10px 'JetBrains Mono', monospace";
+    g.fillStyle = "rgba(150,168,255,0.78)";
+    g.textAlign = "center";
+    g.textBaseline = "top";
+    g.fillText(`reset window ±${data.nextWindowDays}d`, estX, ey + 56);
+  }
+
   // predicted next — big dashed moon + date
   {
     const y = Y(data.nextTf);
@@ -401,9 +438,28 @@ export function ForecastDashboard({
   const nowRef = useRef<number>(0);
   if (nowRef.current === 0) nowRef.current = Date.parse(forecast.generatedAt) || Date.now();
   const moon = useMemo(
-    () => buildMoonData(initialEvents, cadence?.medianGapHours ?? null, nowRef.current),
+    () => buildMoonData(initialEvents, cadence?.medianGapHours ?? null, nowRef.current, cadence?.sigHatHours ?? null),
     [initialEvents, cadence]
   );
+
+  // Soft "a reset may have just happened" flag — read straight off live signals,
+  // NEVER written into reset history / cadence. Keeps the ground truth clean while
+  // still letting the UI react the moment people report a fresh reset.
+  const recentResetSignal = useMemo(() => {
+    const now = nowRef.current;
+    for (const s of forecast.topSignals ?? []) {
+      const t = `${s.title} ${s.text}`.toLowerCase();
+      const applied =
+        /reset[^.]{0,40}(was |been |has been |appears to have been )?appl|just\s+(got\s+|been\s+)?reset|reset\s+(just\s+)?(happen|occurr|went through)/.test(t);
+      const feature = /would like|please add|feature request|i'?d like|show (the |banked )?reset|add .*reset (count|state|status)/.test(t);
+      const pub = Date.parse(s.publishedAt);
+      const recent = Number.isFinite(pub) && now - pub < 48 * 3_600_000 && now - pub > -3_600_000;
+      if (applied && !feature && recent && s.strength >= 0.7) {
+        return { url: s.url };
+      }
+    }
+    return null;
+  }, [forecast.topSignals]);
 
   // Live values the rAF loop reads.
   const dataRef = useRef<{ moon: MoonData; illum: number; chance: number }>({ moon, illum, chance });
@@ -711,6 +767,18 @@ export function ForecastDashboard({
                 <b>{chance}%</b> illuminated
               </div>
             </div>
+            {recentResetSignal ? (
+              <a
+                className="reset-flash"
+                href={recentResetSignal.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                role="status"
+              >
+                <span className="reset-flash-dot" aria-hidden="true" />
+                <span>Signal: a reset may have just been applied — awaiting official confirmation</span>
+              </a>
+            ) : null}
             <div className="next-reset">
               <span className="ic" aria-hidden="true">
                 🌕
