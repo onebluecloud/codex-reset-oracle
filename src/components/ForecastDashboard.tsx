@@ -370,11 +370,6 @@ function drawResetTimeline(
     g.lineTo(estX + sigPx, ey);
     g.stroke();
     g.setLineDash([]);
-    g.font = "500 10px 'JetBrains Mono', monospace";
-    g.fillStyle = "rgba(150,168,255,0.78)";
-    g.textAlign = "center";
-    g.textBaseline = "top";
-    g.fillText(`reset window ±${data.nextWindowDays}d`, estX, ey + 56);
   }
 
   // predicted next — big dashed moon + date
@@ -387,9 +382,12 @@ function drawResetTimeline(
     g.textBaseline = "alphabetic";
     g.fillText("EST. RESET", estX, y - 42);
     g.font = "500 11px 'JetBrains Mono', monospace";
-    g.fillStyle = "rgba(150,162,225,0.85)";
+    g.fillStyle = data.overdue ? "rgba(255,201,142,0.92)" : "rgba(150,162,225,0.85)";
     g.textBaseline = "top";
-    g.fillText(data.nextDate, estX, y + 38);
+    const estLabel = data.overdue
+      ? `${data.nextDate} · overdue ${Math.abs(data.nextDays ?? 0)}d`
+      : data.nextDate;
+    g.fillText(estLabel, estX, y + 38);
   }
 
   // NOW marker on the curve + days-to-next
@@ -415,11 +413,10 @@ function drawResetTimeline(
     g.textAlign = "center";
     g.textBaseline = "alphabetic";
     g.fillText("NOW", nowX, y - 62);
-    if (data.nextDays !== null) {
+    if (data.nextDays !== null && !data.overdue) {
       g.font = "700 13px 'JetBrains Mono', monospace";
-      g.fillStyle = data.overdue ? "rgba(255,200,140,0.95)" : "rgba(198,208,255,0.96)";
-      const daysLabel = data.overdue ? `OVERDUE ${Math.abs(data.nextDays)}D` : `${data.nextDays} DAYS`;
-      g.fillText(daysLabel, (nowX + estX) / 2, Y((data.nowTf + data.nextTf) / 2) + 58);
+      g.fillStyle = "rgba(198,208,255,0.96)";
+      g.fillText(`${data.nextDays} DAYS`, (nowX + estX) / 2, Y((data.nowTf + data.nextTf) / 2) + 58);
     }
   }
 }
